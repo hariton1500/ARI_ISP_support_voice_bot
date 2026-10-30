@@ -3,6 +3,10 @@
 # В этом файле рекомендации Asterisk с паролем ARI в открытом виде
 ari-ivr_ai.md
 
+# Временное окружение и результаты замеров TTS (tools/tts_benchmark.py)
+.bench-tts/
+tts-bench*/
+
 # Python
 __pycache__/
 *.py[cod]

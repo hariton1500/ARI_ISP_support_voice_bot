@@ -1,0 +1,95 @@
+"""Тесты модели сценария."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from app.config import PROJECT_ROOT
+from app.dialog.scenario import Scenario, ScenarioError
+
+DEFAULT_SCENARIO = PROJECT_ROOT / "scenarios" / "default.json"
+
+
+def _raw(**steps: dict) -> dict:
+    return {"name": "t", "initial": next(iter(steps)), "steps": steps}
+
+
+def test_default_scenario_is_valid() -> None:
+    scenario = Scenario.load(DEFAULT_SCENARIO)
+    assert scenario.name == "default"
+    assert scenario.initial == "greeting"
+    assert scenario.steps["menu"].dtmf["0"] == "operator"
+    assert scenario.steps["operator"].hangup is True
+    assert "menu.wav" in scenario.prompt_names
+    assert len(scenario.prompt_names) == len(set(scenario.prompt_names))
+
+
+def test_step_defaults() -> None:
+    scenario = Scenario.from_dict(_raw(step={"prompt": "a.wav"}))
+    step = scenario.steps["step"]
+    assert step.timeout_ms == 8000
+    assert step.max_attempts == 2
+    assert step.next is None
+    assert step.hangup is False
+
+
+def test_initial_defaults_to_first_step() -> None:
+    scenario = Scenario.from_dict({"steps": {"a": {}, "b": {}}})
+    assert scenario.initial == "a"
+
+
+def test_unknown_transition_is_rejected() -> None:
+    with pytest.raises(ScenarioError, match="next"):
+        Scenario.from_dict(_raw(a={"next": "missing"}))
+
+
+def test_unknown_dtmf_target_is_rejected() -> None:
+    with pytest.raises(ScenarioError, match="dtmf"):
+        Scenario.from_dict(_raw(a={"dtmf": {"1": "nope"}}))
+
+
+def test_dtmf_digit_must_be_single_character() -> None:
+    with pytest.raises(ScenarioError, match="DTMF"):
+        Scenario.from_dict(_raw(a={"dtmf": {"12": "a"}}))
+
+
+def test_bad_max_attempts_is_rejected() -> None:
+    with pytest.raises(ScenarioError, match="max_attempts"):
+        Scenario.from_dict(_raw(a={"dtmf": {"1": "a"}, "max_attempts": 0}))
+
+
+def test_negative_timeout_is_rejected() -> None:
+    with pytest.raises(ScenarioError, match="timeout_ms"):
+        Scenario.from_dict(_raw(a={"timeout_ms": -1}))
+
+
+def test_empty_steps_rejected() -> None:
+    with pytest.raises(ScenarioError):
+        Scenario.from_dict({"initial": "a", "steps": {}})
+
+
+def test_links_are_validated_after_parsing() -> None:
+    raw = _raw(a={"dtmf": {"1": "b"}, "on_timeout": "x"}, b={"next": "a"})
+    with pytest.raises(ScenarioError) as exc_info:
+        Scenario.from_dict(raw)
+    assert "on_timeout" in str(exc_info.value)
+
+
+def test_missing_file_raises(tmp_path: Path) -> None:
+    with pytest.raises(ScenarioError, match="прочитать"):
+        Scenario.load(tmp_path / "nope.json")
+
+
+def test_invalid_json_raises(tmp_path: Path) -> None:
+    path = tmp_path / "bad.json"
+    path.write_text("{oops", encoding="utf-8")
+    with pytest.raises(ScenarioError, match="JSON"):
+        Scenario.load(path)
+
+
+def test_steps_mapping_is_read_only() -> None:
+    scenario = Scenario.load(DEFAULT_SCENARIO)
+    with pytest.raises(TypeError):
+        scenario.steps["new"] = scenario.steps["menu"]  # type: ignore[index]

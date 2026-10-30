@@ -1,0 +1,18 @@
+; ---------------------------------------------------------------------------
+; HTTP/ARI для управления вызовом (следующий этап).
+; Файл: /etc/asterisk/http.conf
+;
+; Для продакшена обязательно включите TLS: ARI передаёт Basic Auth (в т.ч.
+; пароль) и события вызова, по открытому HTTP это недопустимо.
+; ---------------------------------------------------------------------------
+
+[general]
+enabled = yes
+bindaddr = 127.0.0.1
+bindport = 8088
+
+; produc = yes
+; tlsenable = yes
+; tlsbindaddr = 0.0.0.0:8089
+; tlscertfile = /etc/asterisk/keys/asterisk.pem
+; tlsprivatekey = /etc/asterisk/keys/asterisk.key

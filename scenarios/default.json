@@ -1,0 +1,67 @@
+{
+  "name": "default",
+  "description": "Меню службы поддержки абонентов: баланс, техподдержка, оплата, оператор",
+  "initial": "greeting",
+  "steps": {
+    "greeting": {
+      "label": "приветствие",
+      "prompt": "greeting.wav",
+      "next": "menu"
+    },
+    "menu": {
+      "label": "главное меню",
+      "prompt": "menu.wav",
+      "timeout_ms": 8000,
+      "max_attempts": 2,
+      "dtmf": {
+        "1": "balance",
+        "2": "tech_support",
+        "3": "payment",
+        "9": "menu_repeat",
+        "0": "operator"
+      },
+      "on_invalid": "invalid_digit",
+      "on_timeout": "no_input"
+    },
+    "menu_repeat": {
+      "label": "повтор меню",
+      "prompt": "menu.wav",
+      "next": "menu"
+    },
+    "invalid_digit": {
+      "label": "неверная цифра",
+      "prompt": "invalid_digit.wav",
+      "next": "menu"
+    },
+    "no_input": {
+      "label": "нет ввода",
+      "prompt": "no_input.wav",
+      "next": "menu"
+    },
+    "balance": {
+      "label": "баланс (заглушка, здесь будет запрос к биллингу)",
+      "prompt": "balance.wav",
+      "next": "menu"
+    },
+    "tech_support": {
+      "label": "техподдержка (заглушка)",
+      "prompt": "tech_support.wav",
+      "next": "menu"
+    },
+    "payment": {
+      "label": "оплата (заглушка)",
+      "prompt": "payment.wav",
+      "next": "menu"
+    },
+    "operator": {
+      "label": "соединение с оператором",
+      "prompt": "operator.wav",
+      "hangup": true
+    },
+    "fallback": {
+      "label": "перевод на оператора после нескольких неудач",
+      "prompt": "fallback.wav",
+      "hangup": true
+    }
+  }
+}

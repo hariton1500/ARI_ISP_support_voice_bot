@@ -1,0 +1,209 @@
+"""Модель сценария диалога.
+
+Сценарий — это JSON-файл с именованными шагами. Шаг умеет:
+  * проиграть промпт (`prompt` — имя файла относительно PROMPTS_DIR);
+  * принять DTMF-цифру и перейти на другой шаг (`dtmf`);
+  * перейти на шаг без ожидания цифры (`next`);
+  * обработать отсутствие ввода (`on_timeout`) и неверную цифру (`on_invalid`);
+  * завершить вызов (`hangup`).
+
+Логика обработки ввода:
+  1. цифра есть в `dtmf` — переход по карте;
+  2. цифры нет за `timeout_ms` или пришла неверная цифра — счётчик попыток
+     растёт, шаг повторяется (промпт играется заново);
+  3. после `max_attempts` попыток — переход на `on_invalid` (неверная цифра)
+     или `on_timeout` (нет ввода); если нужного перехода нет, берётся
+     `on_timeout`, а если нет и его — вызов завершается.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Mapping
+
+DEFAULT_TIMEOUT_MS = 8000
+DEFAULT_MAX_ATTEMPTS = 2
+DTMF_ALPHABET = frozenset("0123456789*#ABCD")
+
+
+class ScenarioError(ValueError):
+    """Сценарий не прошёл валидацию."""
+
+
+@dataclass(frozen=True, slots=True)
+class Step:
+    """Один шаг диалога."""
+
+    name: str
+    label: str
+    prompt: str | None
+    next: str | None
+    dtmf: Mapping[str, str]
+    on_timeout: str | None
+    on_invalid: str | None
+    timeout_ms: int
+    max_attempts: int
+    hangup: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Scenario:
+    """Набор шагов и точка входа."""
+
+    name: str
+    description: str
+    initial: str
+    steps: Mapping[str, Step]
+    source: Path | None = None
+
+    def __post_init__(self) -> None:
+        if not self.steps:
+            raise ScenarioError("сценарий не содержит шагов")
+        if self.initial not in self.steps:
+            raise ScenarioError(f"начальный шаг {self.initial!r} отсутствует в сценарии")
+
+    @property
+    def prompt_names(self) -> tuple[str, ...]:
+        names = {step.prompt for step in self.steps.values() if step.prompt}
+        return tuple(sorted(names))
+
+    @classmethod
+    def load(cls, path: str | Path) -> Scenario:
+        """Загрузить и провалидировать сценарий из файла."""
+        source = Path(path)
+        try:
+            raw_text = source.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ScenarioError(f"не удалось прочитать сценарий {source}: {exc}") from exc
+        try:
+            raw = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            raise ScenarioError(f"некорректный JSON в {source}: {exc}") from exc
+        return cls.from_dict(raw, source=source)
+
+    @classmethod
+    def from_dict(cls, raw: Any, *, source: Path | None = None) -> Scenario:
+        """Собрать сценарий из уже разобранного JSON."""
+        if not isinstance(raw, dict):
+            raise ScenarioError("корень сценария должен быть JSON-объектом")
+
+        name = _as_str(raw.get("name"), "сценарий", "name", default=source.stem if source else "scenario")
+        description = _as_str(raw.get("description"), "сценарий", "description", default="")
+        initial = _as_str(raw.get("initial"), "сценарий", "initial", default="")
+
+        raw_steps = raw.get("steps")
+        if not isinstance(raw_steps, dict) or not raw_steps:
+            raise ScenarioError("поле steps должно быть непустым объектом")
+
+        steps: dict[str, Step] = {}
+        for step_name, raw_step in raw_steps.items():
+            if not isinstance(step_name, str) or not step_name:
+                raise ScenarioError(f"некорректное имя шага: {step_name!r}")
+            steps[step_name] = _parse_step(step_name, raw_step)
+
+        scenario = cls(
+            name=name,
+            description=description,
+            initial=initial or next(iter(steps)),
+            steps=MappingProxyType(steps),
+            source=source,
+        )
+        scenario._validate_links()
+        return scenario
+
+    def _validate_links(self) -> None:
+        errors: list[str] = []
+        for step in self.steps.values():
+            targets: list[tuple[str, str]] = []
+            if step.next:
+                targets.append(("next", step.next))
+            if step.on_timeout:
+                targets.append(("on_timeout", step.on_timeout))
+            if step.on_invalid:
+                targets.append(("on_invalid", step.on_invalid))
+            targets.extend((f"dtmf[{digit}]", target) for digit, target in step.dtmf.items())
+            for field_name, target in targets:
+                if target not in self.steps:
+                    errors.append(
+                        f"шаг {step.name!r}: {field_name} ссылается на {target!r}, которого нет"
+                    )
+        if errors:
+            raise ScenarioError("; ".join(errors))
+
+
+def _parse_step(step_name: str, raw: Any) -> Step:
+    if not isinstance(raw, dict):
+        raise ScenarioError(f"шаг {step_name!r} должен быть JSON-объектом")
+    where = f"шаг {step_name!r}"
+
+    prompt = raw.get("prompt")
+    if prompt is not None:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ScenarioError(f"шаг {step_name!r}: prompt должен быть непустой строкой")
+        prompt = prompt.strip()
+
+    raw_dtmf = raw.get("dtmf") or {}
+    if not isinstance(raw_dtmf, dict):
+        raise ScenarioError(f"шаг {step_name!r}: dtmf должен быть объектом")
+    dtmf: dict[str, str] = {}
+    for digit, target in raw_dtmf.items():
+        if not isinstance(digit, str) or len(digit) != 1 or digit.upper() not in DTMF_ALPHABET:
+            raise ScenarioError(f"шаг {step_name!r}: некорректная DTMF-цифра {digit!r}")
+        if not isinstance(target, str) or not target.strip():
+            raise ScenarioError(f"шаг {step_name!r}: для цифры {digit!r} не указан шаг перехода")
+        dtmf[digit.upper()] = target.strip()
+
+    timeout_ms = _as_int(raw.get("timeout_ms"), where, "timeout_ms", DEFAULT_TIMEOUT_MS)
+    max_attempts = _as_int(raw.get("max_attempts"), where, "max_attempts", DEFAULT_MAX_ATTEMPTS)
+    if timeout_ms < 0:
+        raise ScenarioError(f"{where}: timeout_ms не может быть отрицательным")
+    if max_attempts < 1:
+        raise ScenarioError(f"{where}: max_attempts должен быть не меньше 1")
+
+    return Step(
+        name=step_name,
+        label=_as_str(raw.get("label"), where, "label", default=step_name),
+        prompt=prompt,
+        next=_as_optional_str(raw.get("next"), where, "next"),
+        dtmf=MappingProxyType(dtmf),
+        on_timeout=_as_optional_str(raw.get("on_timeout"), where, "on_timeout"),
+        on_invalid=_as_optional_str(raw.get("on_invalid"), where, "on_invalid"),
+        timeout_ms=timeout_ms,
+        max_attempts=max_attempts,
+        hangup=_as_bool(raw.get("hangup"), where, "hangup", False),
+    )
+
+
+def _as_str(value: Any, where: str, fieldname: str, *, default: str) -> str:
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ScenarioError(f"{where}: {fieldname} должен быть строкой")
+    return value
+
+
+def _as_optional_str(value: Any, where: str, fieldname: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ScenarioError(f"{where}: {fieldname} должен быть строкой")
+    return value.strip() or None
+
+
+def _as_int(value: Any, where: str, fieldname: str, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ScenarioError(f"{where}: {fieldname} должен быть целым числом")
+    return value
+
+
+def _as_bool(value: Any, where: str, fieldname: str, default: bool) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ScenarioError(f"{where}: {fieldname} должен быть true/false")
+    return value

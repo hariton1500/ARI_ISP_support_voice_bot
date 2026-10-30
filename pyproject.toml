@@ -1,0 +1,16 @@
+[project]
+name = "ari-isp-support-voice-bot"
+version = "0.1.0"
+description = "Голосовой бот службы поддержки абонентов оператора связи на Asterisk (ARI + AudioSocket)"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26,<3",
+    "python-dotenv>=1.0,<2",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+# basetemp задан явно: на некоторых Windows-машинах системный %TEMP%\pytest-of-<user>
+# остаётся с испорченными правами после аварийного завершения прогона.
+addopts = "-q --basetemp=.pytest-tmp"

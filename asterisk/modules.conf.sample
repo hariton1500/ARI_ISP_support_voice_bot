@@ -1,0 +1,17 @@
+; ---------------------------------------------------------------------------
+; Минимально необходимые модули для AudioSocket-бота.
+; Файл: /etc/asterisk/modules.conf
+; ---------------------------------------------------------------------------
+
+[modules]
+autoload=yes
+
+; AudioSocket-канал: без него приложение AudioSocket() не загрузится.
+load => chan_audiosocket.so
+load => app_audiosocket.so
+
+; Понадобится на следующем этапе (ARI + WebSocket):
+; load => res_ari.so
+; load => res_ari_events.so
+; load => res_ari_channels.so
+; load => res_http_websocket.so

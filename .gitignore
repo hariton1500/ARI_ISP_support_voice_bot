@@ -1,0 +1,27 @@
+# Секреты
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.pytest-tmp/
+.pytest-report.txt
+.mypy_cache/
+.ruff_cache/
+
+# Записи разговоров и служебные данные
+recordings/
+*.log
+
+# Сгенерированные заглушки промптов
+prompts/placeholder/
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

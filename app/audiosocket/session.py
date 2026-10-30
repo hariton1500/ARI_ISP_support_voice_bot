@@ -1,0 +1,466 @@
+"""Обработка одного вызова AudioSocket.
+
+Сессия получает фреймы от Asterisk, проигрывает промпты с реальным темпом,
+принимает DTMF, пишет входящий звук в WAV и складывает рядом JSON-метаданные
+для разбора инцидентов.
+
+Схема работы с Asterisk:
+
+    Asterisk --(TCP: UUID, PCM, DTMF)--> AudioSocketServer --> CallSession
+
+Asterisk подключается к боту сам (см. диалплан `AudioSocket(${UUID()},host:port)`),
+поэтому сервер — это мы, а не Asterisk.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import time
+import uuid as uuid_module
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+from app.audio.pcm import SAMPLE_RATE, resample
+from app.audio.playback import AudioPlayer
+from app.audio.recorder import WavRecorder
+from app.audiosocket.protocol import (
+    AUDIO_KINDS,
+    Frame,
+    FrameKind,
+    encode_audio,
+    encode_terminate,
+    read_frame,
+)
+from app.config import Settings
+from app.dialog.prompts import PromptMap
+from app.dialog.scenario import Scenario, Step
+
+
+class DigitBuffer:
+    """Очередь DTMF-цифр.
+
+    asyncio.Queue не подходит: отмена get() может «съесть» уже пришедшую цифру.
+    Здесь deque + Event, а признак закрытия позволяет разбудить ожидающего и
+    корректно завершить диалог.
+    """
+
+    def __init__(self) -> None:
+        self._items: deque[str] = deque()
+        self._ready = asyncio.Event()
+        self._closed = False
+
+    def push(self, digit: str) -> None:
+        if self._closed or not digit:
+            return
+        self._items.append(digit)
+        self._ready.set()
+
+    def close(self) -> None:
+        self._closed = True
+        self._ready.set()
+
+    @property
+    def pending(self) -> int:
+        return len(self._items)
+
+    async def get(self, timeout: float | None) -> str | None:
+        """Вернуть цифру, None по таймауту; ConnectionAbortedError — вызов завершён."""
+        if self._items:
+            return self._items.popleft()
+        if self._closed:
+            raise ConnectionAbortedError("вызов завершён")
+        self._ready.clear()
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout)
+        except asyncio.TimeoutError:
+            if self._items:
+                return self._items.popleft()
+            return None
+        if self._items:
+            return self._items.popleft()
+        raise ConnectionAbortedError("вызов завершён")
+
+
+@dataclass(slots=True)
+class CallStats:
+    """Сводка по вызову для логов и sidecar-JSON."""
+
+    started_at: float = field(default_factory=time.monotonic)
+    started_wall: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    audio_frames: int = 0
+    audio_bytes: int = 0
+    dtmf_digits: list[str] = field(default_factory=list)
+    steps: list[str] = field(default_factory=list)
+    hangup_reason: str = "dialog_end"
+
+
+class CallSession:
+    """Один вызов: чтение фреймов, диалог, запись."""
+
+    def __init__(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        settings: Settings,
+        scenario: Scenario,
+        prompts: PromptMap,
+        *,
+        logger: logging.Logger | None = None,
+        peer: str | None = None,
+    ) -> None:
+        self._reader = reader
+        self._writer = writer
+        self._settings = settings
+        self._scenario = scenario
+        self._prompts = prompts
+        self._log = logger or logging.getLogger("app.session")
+        self._peer = peer
+
+        self.session_id: str | None = None
+        self._digits = DigitBuffer()
+        self._player = AudioPlayer(self._send_audio)
+        self._recorder: WavRecorder | None = None
+        self._recording_path: Path | None = None
+        self._closed = False
+        self._read_task: asyncio.Task[None] | None = None
+        self._stats = CallStats()
+
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
+
+    @property
+    def stats(self) -> CallStats:
+        return self._stats
+
+    async def run(self) -> None:
+        """Обработать вызов до завершения диалога или обрыва соединения."""
+        try:
+            channel_uuid = await asyncio.wait_for(
+                self._read_initial_uuid(), timeout=self._settings.init_timeout
+            )
+            if channel_uuid is None:
+                self._stats.hangup_reason = "no_uuid"
+                return
+            self.session_id = str(channel_uuid)
+            self._open_recorder()
+            self._log.info("вызов %s: диалог начат (peer=%s)", self.session_id, self._peer or "?")
+            self._read_task = asyncio.create_task(
+                self._read_frames(), name=f"audiosocket-read-{self.session_id}"
+            )
+
+            limit = self._settings.max_call_seconds
+            if limit and limit > 0:
+                await asyncio.wait_for(self._run_dialog(), timeout=limit)
+            else:
+                await self._run_dialog()
+        except asyncio.CancelledError:
+            self._stats.hangup_reason = "cancelled"
+            raise
+        except asyncio.TimeoutError:
+            if self.session_id is None:
+                self._stats.hangup_reason = "no_uuid"
+                self._log.warning("вызов без UUID: Asterisk не прислал фрейм 0x01")
+            else:
+                self._stats.hangup_reason = "max_duration"
+                self._log.warning(
+                    "вызов %s: превышена максимальная длительность %.0f с",
+                    self.session_id,
+                    self._settings.max_call_seconds,
+                )
+        except ConnectionAbortedError:
+            self._stats.hangup_reason = "peer_closed"
+        except (ConnectionError, OSError) as exc:
+            self._stats.hangup_reason = "connection_error"
+            self._log.warning("вызов %s: обрыв соединения: %s", self.session_id or "?", exc)
+        except Exception:  # noqa: BLE001 - сессия не должна ронять сервер
+            self._stats.hangup_reason = "error"
+            self._log.exception("вызов %s: неожиданная ошибка", self.session_id or "?")
+        finally:
+            await self._shutdown()
+
+    def abort(self) -> None:
+        """Аварийно прервать вызов (используется при остановке сервера)."""
+        self._closed = True
+        self._player.stop()
+        self._digits.close()
+        with contextlib.suppress(Exception):
+            self._writer.close()
+
+    # ------------------------------------------------------- приём фреймов
+
+    async def _read_initial_uuid(self) -> uuid_module.UUID | None:
+        """Дождаться первого осмысленного фрейма: 0x01 (UUID) или 0x00."""
+        while True:
+            frame = await read_frame(self._reader)
+            if frame is None:
+                return None
+            if frame.kind == FrameKind.UUID:
+                channel_uuid = frame.as_uuid()
+                if channel_uuid is None:
+                    raise ConnectionError("фрейм UUID пришёл с некорректной длиной payload")
+                return channel_uuid
+            if frame.kind == FrameKind.TERMINATE:
+                return None
+            if frame.kind == FrameKind.ERROR:
+                self._log.warning(
+                    "Asterisk сообщил об ошибке AudioSocket: %s", frame.payload.hex() or "без кода"
+                )
+                return None
+            self._log.debug("до UUID получен фрейм %s — игнорируем", frame.kind_name)
+
+    async def _read_frames(self) -> None:
+        """Читать фреймы до конца соединения и разбудить диалог при обрыве."""
+        try:
+            while True:
+                frame = await read_frame(self._reader, timeout=self._settings.idle_timeout or None)
+                if frame is None:
+                    self._stats.hangup_reason = "peer_closed"
+                    break
+                if frame.kind in AUDIO_KINDS:
+                    self._on_audio(frame)
+                elif frame.kind == FrameKind.DTMF:
+                    self._on_dtmf(frame)
+                elif frame.kind == FrameKind.TERMINATE:
+                    self._stats.hangup_reason = "terminated"
+                    break
+                elif frame.kind == FrameKind.ERROR:
+                    self._stats.hangup_reason = "asterisk_error"
+                    self._log.warning(
+                        "вызов %s: ошибка AudioSocket от Asterisk: %s",
+                        self.session_id,
+                        frame.payload.hex() or "без кода",
+                    )
+                    break
+                else:
+                    self._log.debug("вызов %s: неизвестный фрейм 0x%02x", self.session_id, frame.kind)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            self._stats.hangup_reason = "idle_timeout"
+            self._log.warning(
+                "вызов %s: нет аудио дольше %.0f с — завершаем",
+                self.session_id,
+                self._settings.idle_timeout,
+            )
+        except (ConnectionError, OSError) as exc:
+            self._stats.hangup_reason = "connection_error"
+            self._log.warning("вызов %s: соединение потеряно: %s", self.session_id, exc)
+        finally:
+            self._closed = True
+            self._player.stop()
+            self._digits.close()
+
+    def _on_audio(self, frame: Frame) -> None:
+        pcm = frame.payload
+        rate = frame.sample_rate or SAMPLE_RATE
+        if rate != SAMPLE_RATE:
+            pcm = resample(pcm, rate, SAMPLE_RATE)
+        if not pcm:
+            return
+        self._stats.audio_frames += 1
+        self._stats.audio_bytes += len(pcm)
+        if self._recorder is not None:
+            self._recorder.write(pcm)
+
+    def _on_dtmf(self, frame: Frame) -> None:
+        digit = frame.as_dtmf()
+        if digit is None:
+            self._log.debug("вызов %s: некорректный DTMF-фрейм %r", self.session_id, frame.payload)
+            return
+        self._stats.dtmf_digits.append(digit)
+        self._log.info("вызов %s: DTMF %r", self.session_id, digit)
+        if self._player.is_playing:
+            self._player.stop()
+        self._digits.push(digit)
+
+    async def _send_audio(self, pcm: bytes) -> None:
+        if self._closed:
+            raise ConnectionAbortedError("вызов завершён")
+        self._writer.write(encode_audio(pcm))
+        await self._writer.drain()
+
+    # ------------------------------------------------------------- диалог
+
+    async def _run_dialog(self) -> None:
+        """Пройти по шагам сценария, начиная с initial."""
+        current: str | None = self._scenario.initial
+        while current and not self._closed:
+            step = self._scenario.steps.get(current)
+            if step is None:
+                self._log.error("вызов %s: шаг %r отсутствует в сценарии", self.session_id, current)
+                break
+            self._stats.steps.append(current)
+            self._log.info("вызов %s: шаг %s (%s)", self.session_id, current, step.label)
+            current = await self._run_step(step)
+            if step.hangup:
+                self._stats.hangup_reason = "hangup_step"
+                break
+
+    async def _run_step(self, step: Step) -> str | None:
+        """Проиграть шаг и вернуть имя следующего шага (None — конец диалога)."""
+        attempts = 0
+        while True:
+            if self._closed:
+                raise ConnectionAbortedError("вызов завершён")
+            await self._play_prompt(step)
+            if step.hangup:
+                return None
+            if not step.dtmf:
+                return step.next
+
+            if self._closed:
+                raise ConnectionAbortedError("вызов завершён")
+            attempts += 1
+            digit = await self._wait_digit(step)
+
+            if digit is not None and digit in step.dtmf:
+                target = step.dtmf[digit]
+                self._log.info(
+                    "вызов %s: шаг %s, цифра %r -> %s", self.session_id, step.name, digit, target
+                )
+                return target
+
+            # Исчерпали попытки — уходим по fallback-переходу.
+            if attempts >= step.max_attempts:
+                target = step.on_invalid if digit is not None else step.on_timeout
+                if target is None:
+                    target = step.on_timeout
+                self._log.info(
+                    "вызов %s: шаг %s, попытки исчерпаны (%s) -> %s",
+                    self.session_id,
+                    step.name,
+                    "неверная цифра" if digit is not None else "нет ввода",
+                    target or "завершение вызова",
+                )
+                return target
+
+            self._log.info(
+                "вызов %s: шаг %s, %s (попытка %d из %d)",
+                self.session_id,
+                step.name,
+                "неверная цифра" if digit is not None else "нет ввода",
+                attempts,
+                step.max_attempts,
+            )
+
+    async def _play_prompt(self, step: Step) -> None:
+        if self._closed:
+            raise ConnectionAbortedError("вызов завершён")
+        if not step.prompt:
+            return
+        pcm = self._prompts.get(step.prompt)
+        if not pcm:
+            self._log.debug(
+                "вызов %s: промпт %r не загружен — шаг %s без звука",
+                self.session_id,
+                step.prompt,
+                step.name,
+            )
+            return
+        completed = await self._player.play(pcm)
+        if not completed:
+            self._log.debug("вызов %s: промпт шага %s прерван", self.session_id, step.name)
+
+    async def _wait_digit(self, step: Step) -> str | None:
+        return await self._digits.get(max(0.0, step.timeout_ms / 1000.0))
+
+    # ----------------------------------------------- запись и метаданные
+
+    def _open_recorder(self) -> None:
+        if not self._settings.record_calls or self.session_id is None:
+            return
+        recorder = WavRecorder(self._settings.recordings_dir / f"{self.session_id}.wav")
+        try:
+            recorder.open()
+        except OSError as exc:
+            self._log.error(
+                "вызов %s: не удалось открыть запись %s: %s", self.session_id, recorder.path, exc
+            )
+            return
+        self._recorder = recorder
+        self._log.debug("вызов %s: пишем входящий звук в %s", self.session_id, recorder.path)
+
+    def _close_recorder(self) -> None:
+        recorder, self._recorder = self._recorder, None
+        if recorder is None:
+            return
+        try:
+            recorder.close()
+        except OSError as exc:
+            self._log.warning("вызов %s: ошибка закрытия записи: %s", self.session_id, exc)
+            return
+        self._recording_path = recorder.path
+        self._log.info(
+            "вызов %s: запись сохранена %s (%.1f с входящего звука)",
+            self.session_id,
+            recorder.path,
+            recorder.duration_ms / 1000.0,
+        )
+
+    def _write_metadata(self) -> None:
+        """Положить рядом с записью JSON с ходом диалога."""
+        if self.session_id is None or self._recording_path is None:
+            return
+        duration = time.monotonic() - self._stats.started_at
+        payload = {
+            "session_id": self.session_id,
+            "scenario": self._scenario.name,
+            "peer": self._peer,
+            "started_at": self._stats.started_wall.isoformat(),
+            "duration_seconds": round(duration, 3),
+            "audio_frames": self._stats.audio_frames,
+            "audio_seconds": round(self._stats.audio_bytes / (SAMPLE_RATE * 2), 3),
+            "dtmf": "".join(self._stats.dtmf_digits),
+            "steps": list(self._stats.steps),
+            "hangup_reason": self._stats.hangup_reason,
+            "recording": self._recording_path.name,
+        }
+        path = self._recording_path.with_suffix(".json")
+        try:
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            self._log.warning("вызов %s: не удалось записать %s: %s", self.session_id, path, exc)
+
+    # ----------------------------------------------------------- завершение
+
+    async def _shutdown(self) -> None:
+        self._closed = True
+        self._player.stop()
+        self._digits.close()
+
+        if self._read_task is not None:
+            task, self._read_task = self._read_task, None
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 - не мешаем завершению вызова
+                self._log.exception("вызов %s: ошибка фонового чтения", self.session_id)
+
+        self._close_recorder()
+        self._write_metadata()
+
+        if not self._writer.is_closing():
+            with contextlib.suppress(Exception):
+                self._writer.write(encode_terminate())
+                await asyncio.wait_for(self._writer.drain(), timeout=1.0)
+        with contextlib.suppress(Exception):
+            self._writer.close()
+            await asyncio.wait_for(self._writer.wait_closed(), timeout=1.0)
+
+        self._log.info(
+            "вызов %s: завершён (причина=%s, шаги=%s, DTMF=%s, аудио=%.1f с, запись=%s)",
+            self.session_id,
+            self._stats.hangup_reason,
+            "->".join(self._stats.steps) or "-",
+            "".join(self._stats.dtmf_digits) or "-",
+            self._stats.audio_bytes / (SAMPLE_RATE * 2),
+            str(self._recording_path) if self._recording_path else "нет",
+        )

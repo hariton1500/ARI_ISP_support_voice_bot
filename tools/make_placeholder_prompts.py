@@ -28,6 +28,8 @@ PLACEHOLDERS: dict[str, tuple[tuple[int, ...], int]] = {
     "invalid_digit": ((330, 330, 330), 120),
     "no_input": ((300, 300), 180),
     "balance": ((440, 550, 660, 770), 160),
+    "balance_not_found": ((330, 330, 440), 180),
+    "balance_error": ((220, 220, 220, 220), 200),
     "tech_support": ((440, 550, 660, 770, 880), 160),
     "payment": ((440, 550, 660, 770, 880, 990), 160),
     "operator": ((520, 600, 680, 760, 840, 920, 1000), 140),

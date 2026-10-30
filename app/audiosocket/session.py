@@ -37,6 +37,7 @@ from app.audiosocket.protocol import (
     read_frame,
 )
 from app.audiosocket.registry import PendingCall
+from app.billing.client import BillingError, BillingLookup, Subscriber
 from app.config import Settings
 from app.dialog.prompts import PromptMap
 from app.dialog.scenario import Scenario, Step
@@ -98,6 +99,8 @@ class CallStats:
     dtmf_digits: list[str] = field(default_factory=list)
     steps: list[str] = field(default_factory=list)
     hangup_reason: str = "dialog_end"
+    #: Последний ответ биллинга (для sidecar-JSON): outcome, userId и данные абонента.
+    billing: dict[str, object] | None = None
 
 
 class CallSession:
@@ -113,6 +116,7 @@ class CallSession:
         *,
         channel_uuid: uuid_module.UUID,
         pending: PendingCall | None = None,
+        billing: BillingLookup | None = None,
         logger: logging.Logger | None = None,
         peer: str | None = None,
     ) -> None:
@@ -125,6 +129,7 @@ class CallSession:
         self._peer = peer
         self._channel_uuid = channel_uuid
         self._pending = pending
+        self._billing = billing
         self._channel_id: str | None = None
 
         self.session_id: str | None = None
@@ -311,11 +316,12 @@ class CallSession:
 
     async def _run_step(self, step: Step) -> str | None:
         """Проиграть шаг и вернуть имя следующего шага (None — конец диалога)."""
+        prompt = await self._resolve_prompt(step)
         attempts = 0
         while True:
             if self._closed:
                 raise ConnectionAbortedError("вызов завершён")
-            await self._play_prompt(step)
+            await self._play_prompt(step, prompt)
             if step.hangup:
                 return None
             if not step.dtmf:
@@ -356,23 +362,91 @@ class CallSession:
                 step.max_attempts,
             )
 
-    async def _play_prompt(self, step: Step) -> None:
+    async def _play_prompt(self, step: Step, prompt: str | None = None) -> None:
         if self._closed:
             raise ConnectionAbortedError("вызов завершён")
-        if not step.prompt:
+        name = prompt if prompt is not None else step.prompt
+        if not name:
             return
-        pcm = self._prompts.get(step.prompt)
+        pcm = self._prompts.get(name)
         if not pcm:
             self._log.debug(
                 "вызов %s: промпт %r не загружен — шаг %s без звука",
                 self.session_id,
-                step.prompt,
+                name,
                 step.name,
             )
             return
         completed = await self._player.play(pcm)
         if not completed:
             self._log.debug("вызов %s: промпт шага %s прерван", self.session_id, step.name)
+
+    # ------------------------------------------------------------- биллинг
+
+    async def _resolve_prompt(self, step: Step) -> str | None:
+        """Выбрать промпт шага: обычный или по результату запроса в биллинг."""
+        if not step.billing:
+            return step.prompt
+        outcome, _subscriber = await self._lookup_billing(step)
+        if outcome == "found":
+            return step.prompt
+        if outcome == "not_found":
+            return step.prompt_not_found or step.prompt
+        return step.prompt_error or step.prompt
+
+    async def _lookup_billing(self, step: Step) -> tuple[str, Subscriber | None]:
+        """Спросить биллинг: ("found" | "not_found" | "error", абонент)."""
+        user_id = self._billing_user_id(step)
+        if self._billing is None:
+            self._log.error(
+                "вызов %s: шаг %s, биллинг не настроен "
+                "(нужны BILLING_BASE_URL/BILLING_TOKEN или BILLING_MOCK)",
+                self.session_id,
+                step.name,
+            )
+            self._stats.billing = {"outcome": "error", "user_id": user_id, "reason": "not_configured"}
+            return "error", None
+        if not user_id:
+            self._log.warning(
+                "вызов %s: шаг %s, не удалось определить userId для биллинга "
+                "(в режиме ARI нужен номер звонящего)",
+                self.session_id,
+                step.name,
+            )
+            self._stats.billing = {"outcome": "not_found", "user_id": None, "reason": "no_user_id"}
+            return "not_found", None
+        try:
+            subscriber = await self._billing.fetch_subscriber(user_id)
+        except BillingError as exc:
+            self._log.error("вызов %s: шаг %s, биллинг: %s", self.session_id, step.name, exc)
+            self._stats.billing = {"outcome": "error", "user_id": user_id, "reason": str(exc)}
+            return "error", None
+        if subscriber is None:
+            self._log.info(
+                "вызов %s: шаг %s, биллинг: абонент %r не найден",
+                self.session_id,
+                step.name,
+                user_id,
+            )
+            self._stats.billing = {"outcome": "not_found", "user_id": user_id}
+            return "not_found", None
+        self._log.info(
+            "вызов %s: шаг %s, биллинг: %s — %s",
+            self.session_id,
+            step.name,
+            user_id,
+            subscriber.summary,
+        )
+        self._stats.billing = {"outcome": "found", "user_id": user_id, **subscriber.to_dict()}
+        return "found", subscriber
+
+    def _billing_user_id(self, step: Step) -> str:
+        """`userId` из шага: "caller" — номер звонящего, иначе — буквальное значение."""
+        source = (step.billing or "").strip()
+        if source.lower() in {"caller", "ani", "caller_number"}:
+            number = self._pending.caller_number if self._pending else None
+            source = number or ""
+        return "".join(ch for ch in source if ch.isalnum() or ch in {"-", "_"})
 
     async def _wait_digit(self, step: Step) -> str | None:
         return await self._digits.get(max(0.0, step.timeout_ms / 1000.0))
@@ -428,6 +502,7 @@ class CallSession:
             "dtmf": "".join(self._stats.dtmf_digits),
             "steps": list(self._stats.steps),
             "hangup_reason": self._stats.hangup_reason,
+            "billing": self._stats.billing,
             "recording": self._recording_path.name,
         }
         path = self._recording_path.with_suffix(".json")

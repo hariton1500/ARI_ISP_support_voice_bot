@@ -39,8 +39,11 @@
       "next": "menu"
     },
     "balance": {
-      "label": "баланс (заглушка, здесь будет запрос к биллингу)",
+      "label": "баланс из биллинга",
       "prompt": "balance.wav",
+      "prompt_not_found": "balance_not_found.wav",
+      "prompt_error": "balance_error.wav",
+      "billing": "caller",
       "next": "menu"
     },
     "tech_support": {

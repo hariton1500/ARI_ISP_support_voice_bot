@@ -5,7 +5,10 @@
   * принять DTMF-цифру и перейти на другой шаг (`dtmf`);
   * перейти на шаг без ожидания цифры (`next`);
   * обработать отсутствие ввода (`on_timeout`) и неверную цифру (`on_invalid`);
-  * завершить вызов (`hangup`).
+  * завершить вызов (`hangup`);
+  * запросить абонента в биллинге перед промптом (`billing`: `"caller"` или
+    конкретный `userId`) и выбрать промпт по результату
+    (`prompt_not_found` / `prompt_error`).
 
 Логика обработки ввода:
   1. цифра есть в `dtmf` — переход по карте;
@@ -47,6 +50,12 @@ class Step:
     timeout_ms: int
     max_attempts: int
     hangup: bool
+    #: Запрос в биллинг перед промптом: "caller" (номер звонящего) или конкретный userId.
+    billing: str | None = None
+    #: Промпт, если абонент в биллинге не найден (по умолчанию — `prompt`).
+    prompt_not_found: str | None = None
+    #: Промпт, если биллинг недоступен (по умолчанию — `prompt`).
+    prompt_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,7 +76,11 @@ class Scenario:
 
     @property
     def prompt_names(self) -> tuple[str, ...]:
-        names = {step.prompt for step in self.steps.values() if step.prompt}
+        names: set[str] = set()
+        for step in self.steps.values():
+            for name in (step.prompt, step.prompt_not_found, step.prompt_error):
+                if name:
+                    names.add(name)
         return tuple(sorted(names))
 
     @classmethod
@@ -163,6 +176,14 @@ def _parse_step(step_name: str, raw: Any) -> Step:
     if max_attempts < 1:
         raise ScenarioError(f"{where}: max_attempts должен быть не меньше 1")
 
+    billing = _as_optional_str(raw.get("billing"), where, "billing")
+    prompt_not_found = _as_optional_str(raw.get("prompt_not_found"), where, "prompt_not_found")
+    prompt_error = _as_optional_str(raw.get("prompt_error"), where, "prompt_error")
+    if (prompt_not_found or prompt_error) and not billing:
+        raise ScenarioError(
+            f"{where}: prompt_not_found/prompt_error задаются только вместе с billing"
+        )
+
     return Step(
         name=step_name,
         label=_as_str(raw.get("label"), where, "label", default=step_name),
@@ -174,6 +195,9 @@ def _parse_step(step_name: str, raw: Any) -> Step:
         timeout_ms=timeout_ms,
         max_attempts=max_attempts,
         hangup=_as_bool(raw.get("hangup"), where, "hangup", False),
+        billing=billing,
+        prompt_not_found=prompt_not_found,
+        prompt_error=prompt_error,
     )
 
 

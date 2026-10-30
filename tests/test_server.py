@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import uuid
 import wave
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from app.audiosocket.protocol import (
     Frame,
@@ -16,10 +20,13 @@ from app.audiosocket.protocol import (
     encode_frame,
     read_frame,
 )
+from app.audiosocket.registry import PendingCall, PendingRegistry
 from app.audiosocket.server import AudioSocketServer
+from app.billing.client import BillingError, Subscriber
 from app.config import Settings
 from app.dialog.prompts import PromptMap, load_prompts
 from app.dialog.scenario import Scenario
+from tests.conftest import write_wav
 
 
 async def _read_until_eof(reader: asyncio.StreamReader, timeout: float = 10.0) -> list[Frame]:
@@ -149,3 +156,135 @@ def test_client_disconnect_does_not_break_server(
 ) -> None:
     prompts = load_prompts(scenario, prompts_dir)
     asyncio.run(_disconnect_flow(settings, scenario, prompts))
+
+
+# ------------------------------------------------------------------ биллинг
+
+
+class _FakeBilling:
+    """Заглушка клиента биллинга: отдаёт абонента, None или ошибку."""
+
+    def __init__(
+        self,
+        subscriber: Subscriber | None = None,
+        error: BillingError | None = None,
+    ) -> None:
+        self.subscriber = subscriber
+        self.error = error
+        self.user_ids: list[str] = []
+
+    async def fetch_subscriber(self, user_id: str) -> Subscriber | None:
+        self.user_ids.append(user_id)
+        if self.error is not None:
+            raise self.error
+        return self.subscriber
+
+
+def _billing_scenario() -> Scenario:
+    raw = {
+        "name": "billing",
+        "initial": "greeting",
+        "steps": {
+            "greeting": {"prompt": "greeting.wav", "next": "balance"},
+            "balance": {
+                "prompt": "balance.wav",
+                "prompt_not_found": "balance_not_found.wav",
+                "prompt_error": "balance_error.wav",
+                "billing": "caller",
+                "next": "operator",
+            },
+            "operator": {"prompt": "operator.wav", "hangup": True},
+        },
+    }
+    return Scenario.from_dict(raw)
+
+
+async def _billing_flow(
+    tmp_path: Path, billing: _FakeBilling | None
+) -> tuple[int, dict[str, Any]]:
+    """Прогнать вызов с шагом billing; вернуть (байт промптов, метаданные)."""
+    scenario = _billing_scenario()
+    prompts_dir = tmp_path / "prompts"
+    write_wav(prompts_dir / "greeting.wav", duration_ms=200)
+    write_wav(prompts_dir / "balance.wav", duration_ms=100)
+    write_wav(prompts_dir / "balance_not_found.wav", duration_ms=400)
+    write_wav(prompts_dir / "balance_error.wav", duration_ms=600)
+    write_wav(prompts_dir / "operator.wav", duration_ms=200)
+    prompts = load_prompts(scenario, prompts_dir)
+
+    settings = Settings(
+        audiosocket_host="127.0.0.1",
+        audiosocket_port=0,
+        scenario_path=tmp_path / "scenario.json",
+        prompts_dir=prompts_dir,
+        record_calls=True,
+        recordings_dir=tmp_path / "recordings",
+        init_timeout=3.0,
+        idle_timeout=5.0,
+        max_call_seconds=20.0,
+        log_level="WARNING",
+    )
+
+    channel_uuid = uuid.uuid4()
+    registry = PendingRegistry()
+    registry.register(
+        PendingCall(uuid=str(channel_uuid), channel_id="call-1", caller_number="1")
+    )
+    server = AudioSocketServer(settings, scenario, prompts, registry=registry, billing=billing)
+    await server.start()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.bound_port)
+        writer.write(encode_frame(FrameKind.UUID, channel_uuid.bytes))
+        await writer.drain()
+        frames = await _read_until_eof(reader)
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    finally:
+        await server.close()
+
+    total = sum(len(frame.payload) for frame in frames if frame.kind == FrameKind.AUDIO_8K)
+    meta = json.loads(
+        (settings.recordings_dir / f"{channel_uuid}.json").read_text(encoding="utf-8")
+    )
+    return total, meta
+
+
+def test_billing_step_plays_balance_prompt(tmp_path: Path) -> None:
+    billing = _FakeBilling(
+        subscriber=Subscriber(
+            user_id="1", balance=227.23, packet_name="Интернет 100 Мбит", days_left=12
+        )
+    )
+    total, meta = asyncio.run(_billing_flow(tmp_path, billing))
+
+    assert billing.user_ids == ["1"]
+    # greeting 200 мс + balance 100 мс + operator 200 мс (8 кГц, 16 бит)
+    assert total == 8000
+    assert meta["steps"] == ["greeting", "balance", "operator"]
+    assert meta["billing"]["outcome"] == "found"
+    assert meta["billing"]["user_id"] == "1"
+    assert meta["billing"]["balance"] == pytest.approx(227.23)
+
+
+def test_billing_step_plays_not_found_prompt(tmp_path: Path) -> None:
+    total, meta = asyncio.run(_billing_flow(tmp_path, _FakeBilling()))
+    # greeting 200 мс + balance_not_found 400 мс + operator 200 мс
+    assert total == 12800
+    assert meta["billing"]["outcome"] == "not_found"
+
+
+def test_billing_step_plays_error_prompt(tmp_path: Path) -> None:
+    billing = _FakeBilling(error=BillingError("нет связи с биллингом"))
+    total, meta = asyncio.run(_billing_flow(tmp_path, billing))
+    # greeting 200 мс + balance_error 600 мс + operator 200 мс
+    assert total == 16000
+    assert meta["billing"]["outcome"] == "error"
+    assert "нет связи" in meta["billing"]["reason"]
+
+
+def test_billing_step_without_client_uses_error_prompt(tmp_path: Path) -> None:
+    total, meta = asyncio.run(_billing_flow(tmp_path, None))
+    assert total == 16000
+    assert meta["billing"]["outcome"] == "error"
+    assert meta["billing"]["reason"] == "not_configured"

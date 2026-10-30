@@ -18,6 +18,7 @@ import uuid
 
 from app.audiosocket.protocol import read_uuid_frame
 from app.audiosocket.registry import PendingRegistry
+from app.billing.client import BillingLookup
 from app.audiosocket.session import CallSession
 from app.config import Settings
 from app.dialog.prompts import PromptMap
@@ -34,12 +35,14 @@ class AudioSocketServer:
         prompts: PromptMap,
         *,
         registry: PendingRegistry | None = None,
+        billing: BillingLookup | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._settings = settings
         self._scenario = scenario
         self._prompts = prompts
         self._registry = registry
+        self._billing = billing
         self._log = logger or logging.getLogger("app.audiosocket.server")
         self._server: asyncio.AbstractServer | None = None
         self._sessions: set[CallSession] = set()
@@ -127,6 +130,7 @@ class AudioSocketServer:
                 self._prompts,
                 channel_uuid=channel_uuid,
                 pending=pending,
+                billing=self._billing,
                 logger=self._log,
                 peer=peer_name,
             )

@@ -52,6 +52,32 @@ def test_env_overrides(monkeypatch) -> None:
     assert settings.prompts_dir == PROJECT_ROOT / "prompts" / "ru"
 
 
+def test_billing_settings(monkeypatch) -> None:
+    for name in ("BILLING_BASE_URL", "BILLING_TOKEN", "BILLING_MOCK", "BILLING_TIMEOUT"):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings.from_env()
+    assert settings.billing_enabled is False
+    assert settings.billing_timeout == 10.0
+
+    monkeypatch.setenv("BILLING_BASE_URL", "http://billing.local/by-id")
+    monkeypatch.setenv("BILLING_TOKEN", "secret-token")
+    monkeypatch.setenv("BILLING_TIMEOUT", "3,5")
+    settings = Settings.from_env()
+    assert settings.billing_enabled is True
+    assert settings.billing_timeout == 3.5
+    assert settings.masked()["billing_token"] == "***"
+    assert settings.masked()["billing_base_url"] == "http://billing.local/by-id"
+
+
+def test_billing_mock_enables_billing_without_url(monkeypatch) -> None:
+    monkeypatch.delenv("BILLING_BASE_URL", raising=False)
+    monkeypatch.delenv("BILLING_TOKEN", raising=False)
+    monkeypatch.setenv("BILLING_MOCK", "1")
+    settings = Settings.from_env()
+    assert settings.billing_mock is True
+    assert settings.billing_enabled is True
+
+
 def test_bad_port_raises(monkeypatch) -> None:
     monkeypatch.setenv("AUDIOSOCKET_PORT", "abc")
     with pytest.raises(ValueError, match="AUDIOSOCKET_PORT"):

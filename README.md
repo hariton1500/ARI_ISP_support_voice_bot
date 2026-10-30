@@ -60,8 +60,10 @@
   неверном вводе, таймауты, завершение вызова;
 * проигрывание WAV-промптов с реальным темпом (20 мс) и перебивание нажатием;
 * запись входящего звука в WAV + JSON-метаданные вызова;
-* 62 теста, включая сквозной прогон «StasisStart → ExternalMedia → TCP по UUID
-  → DTMF → очистка» на фейковом ARI.
+* запрос в биллинг по `userId` (баланс, тариф, дни, состояние сети) на шаге
+  `balance`; результат уходит в лог и в метаданные вызова;
+* 79 тестов, включая сквозной прогон «StasisStart → ExternalMedia → TCP по UUID
+  → DTMF → очистка» на фейковом ARI и контракт биллинга.
 
 Распознавание речи, синтез и LLM — следующий этап (точки расширения:
 `app/dialog`, `app/audio`).
@@ -76,6 +78,7 @@ pip install -r requirements.txt
 copy .env.example .env          # впишите ARI_PASSWORD и EXTERNAL_MEDIA_HOST
 python tools/make_placeholder_prompts.py   # тоновые заглушки промптов
 python -m app --ari-check       # REST + WebSocket ARI
+python -m app --billing-check 1 # абонент из биллинга (userId=1)
 python -m app --check           # сценарий и промпты
 python -m app                   # бот: ARI + AudioSocket
 ```
@@ -90,7 +93,8 @@ INFO [app.ari.manager] ARI: приложение 'ivr_ai', события ws://�
 ```
 
 Полезные флаги: `--no-ari` (автономный режим без Asterisk), `--port`,
-`--external-media-host`, `--allow-unknown-sessions`, `--log-level DEBUG`.
+`--external-media-host`, `--allow-unknown-sessions`, `--log-level DEBUG`,
+`--billing-check USER_ID`, `--billing-mock`.
 
 ## Сетевое требование (обязательно)
 
@@ -131,6 +135,8 @@ Asterisk наш IP уже в белом списке.
 | вызов идёт, но звука нет | проверьте `format=slin` и строку «медиапоток подключён»; смотрите лог шагов диалога |
 | «UUID … не связан ни с одним вызовом» | TCP пришёл с неизвестным `data`; в ARI-режиме такие соединения отклоняются |
 | «медиаканал … завершился (событие …), канал абонента ещё активен» | Asterisk закрыл `AudioSocket/…` раньше абонента: смотрите в логе АТС строки вокруг `Called …`/`is hung up`. Часто это вызов, завершённый на стороне оператора/провайдера |
+| «биллинг: абонент … не найден» | `userId` не совпал с лицевым счётом: проверьте `billing` в шаге или `python -m app --billing-check <id>` |
+| «биллинг: нет связи…/HTTP 401/500» | проверьте `BILLING_BASE_URL`, `BILLING_TOKEN`, доступность сервиса; в этом случае играется `prompt_error` |
 
 ## Настройки (.env)
 
@@ -152,9 +158,14 @@ Asterisk наш IP уже в белом списке.
 | `INIT_TIMEOUT` | `10` | ожидание UUID в AudioSocket, с |
 | `IDLE_TIMEOUT` | `30` | обрыв при отсутствии фреймов, с |
 | `MAX_CALL_SECONDS` | `600` | лимит длительности вызова, с |
+| `BILLING_BASE_URL` | — | эндпоинт биллинга (`POST {"userId": ...}`) |
+| `BILLING_TOKEN` | — | Bearer-токен биллинга |
+| `BILLING_TIMEOUT` | `10` | таймаут запроса в биллинг, с |
+| `BILLING_MOCK` | `false` | отдавать тестовые данные биллинга без сети |
 | `LOG_LEVEL` | `INFO` | уровень логирования |
 
-Пароль ARI маскируется в логах (`app.logging_setup.SecretFilter`).
+Пароль ARI и токен биллинга маскируются в логах
+(`app.logging_setup.SecretFilter` и `Settings.masked()`).
 
 ## Сценарий диалога
 
@@ -190,12 +201,51 @@ Asterisk наш IP уже в белом списке.
 | `on_invalid` | шаг после исчерпания попыток при неверной цифре |
 | `on_timeout` | шаг при отсутствии ввода |
 | `hangup` | завершить вызов после промпта |
+| `billing` | перед промптом запросить биллинг: `"caller"` (номер звонящего) или конкретный `userId` |
+| `prompt_not_found` | промпт, если абонент не найден (по умолчанию — `prompt`) |
+| `prompt_error` | промпт, если биллинг недоступен (по умолчанию — `prompt`) |
 
 Верная цифра → переход по `dtmf`; неверная цифра или тишина → повтор шага;
 после `max_attempts` → `on_invalid`/`on_timeout` (если перехода нет —
 `on_timeout`, если нет и его — конец диалога). Сценарий валидируется при
 старте: неизвестные ссылки, кривые цифры и отрицательные таймауты дают ошибку
 и код возврата 2.
+
+## Биллинг
+
+Шаг с полем `billing` сначала спрашивает биллинг, потом играет промпт:
+
+```json
+"balance": {
+  "label": "баланс из биллинга",
+  "prompt": "balance.wav",
+  "prompt_not_found": "balance_not_found.wav",
+  "prompt_error": "balance_error.wav",
+  "billing": "caller",
+  "next": "menu"
+}
+```
+
+* `"billing": "caller"` — `userId` берётся из номера звонящего (ARI `caller.number`);
+  можно указать конкретный идентификатор строкой: `"billing": "1"`;
+* найдено → играется `prompt`, в лог уходит строка
+  `биллинг: абонент '1' — баланс 227.23 руб., тариф «Интернет 100 Мбит», …`,
+  а данные попадают в `<uuid>.json` (`billing`);
+* не найдено → `prompt_not_found`, ошибка сети/HTTP → `prompt_error`;
+* запрос идёт по контракту `POST {"userId": "..."}` + `Authorization: Bearer …`
+  (см. `app/billing/client.py`), таймаут — `BILLING_TIMEOUT`.
+
+Проверить связку без звонка:
+
+```powershell
+python -m app --billing-check 1     # код 0 — абонент найден, 1 — нет/ошибка, 2 — не настроен
+python -m app --billing-check 503   # тестовый номер: "не найден"
+python -m app --billing-check 1 --billing-mock   # тестовые данные без сети
+```
+
+Сумма пока не проговаривается голосом: в проекте только тоновые заглушки
+промптов, поэтому шаг сообщает об успехе/неудаче запроса. Для озвучивания
+суммы нужны либо записи диктора с цифрами, либо TTS (следующий этап).
 
 ## Промпты
 
@@ -215,7 +265,8 @@ Asterisk наш IP уже в белом списке.
 * `<uuid>.wav` — входящий звук абонента (8 кГц, моно, 16 бит), где `uuid` —
   значение `data` из ExternalMedia;
 * `<uuid>.json` — сценарий, канал ARI, номер абонента, время, длительность,
-  число аудиофреймов, DTMF, шаги, причина завершения.
+  число аудиофреймов, DTMF, шаги, причина завершения и ответ биллинга
+  (`billing`: `outcome`, `user_id`, баланс, тариф, дни, состояние сети).
 
 ```json
 {
@@ -225,8 +276,16 @@ Asterisk наш IP уже в белом списке.
   "scenario": "default",
   "duration_seconds": 24.7,
   "dtmf": "0",
-  "steps": ["greeting", "menu", "operator"],
+  "steps": ["greeting", "menu", "balance", "menu", "operator"],
   "hangup_reason": "hangup_step",
+  "billing": {
+    "outcome": "found",
+    "user_id": "1",
+    "balance": 227.23,
+    "packet_name": "Интернет 100 Мбит",
+    "days_left": 12,
+    "network_state": "green"
+  },
   "recording": "0c4c6b1e-....wav"
 }
 ```
@@ -238,7 +297,7 @@ Asterisk наш IP уже в белом списке.
 ## Проверка без АТС
 
 ```powershell
-python -m pytest                 # 62 теста, фейковый ARI + реальный TCP
+python -m pytest                 # 79 тестов, фейковый ARI, TCP и биллинг
 ```
 
 Автономный режим (без Asterisk, для отладки сценария):
@@ -254,7 +313,7 @@ python tools/simulate_call.py --digits 0 --save recordings/prompts.wav
 
 ```
 app/
-  __main__.py            запуск, --ari-check, --check, --no-ari
+  __main__.py            запуск, --ari-check, --billing-check, --check, --no-ari
   config.py              настройки из .env
   logging_setup.py       логи + маскирование секретов
   network.py             локальные IPv4 для подсказок
@@ -266,7 +325,9 @@ app/
     protocol.py          фреймы AudioSocket, чтение UUID
     registry.py          связка «UUID ↔ вызов ARI»
     server.py            TCP-сервер, по сессии на соединение
-    session.py           диалог, промпты, запись, DTMF
+    session.py           диалог, промпты, запись, DTMF, запрос в биллинг
+  billing/
+    client.py            POST {"userId": ...} + Bearer, разбор ответа
   audio/                 PCM, ресемплинг, проигрыватель, запись
   dialog/                сценарий и промпты
 asterisk/README.md       что настроено на стороне Asterisk
@@ -275,7 +336,7 @@ tools/
   make_placeholder_prompts.py  заглушки промптов
   simulate_call.py             симулятор АТС (автономный режим)
   check_external_media.py      проверка доступности ExternalMedia
-tests/                   62 теста
+tests/                   79 тестов
 ```
 
 ## Тесты
@@ -285,7 +346,8 @@ python -m pytest
 ```
 
 Покрыто: протокол и аудио, сценарий и промпты, настройки и CLI, ARI REST-клиент,
-реконнект WebSocket, реестр ожидающих вызовов, сквозной вызов
+клиент биллинга (контракт, 400/5xx/не-JSON, mock), выбор промпта по ответу
+биллинга, реконнект WebSocket, реестр ожидающих вызовов, сквозной вызов
 «StasisStart → бридж → ExternalMedia → AudioSocket по UUID → DTMF → очистка»,
 отклонение неизвестного UUID, автономный режим с симулятором.
 

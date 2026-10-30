@@ -123,6 +123,12 @@ class Settings:
     # Разрешать AudioSocket-сессии без зарегистрированного вызова (автономный режим).
     allow_unknown_sessions: bool = True
 
+    # Биллинг: запрос абонента POST-ом с Bearer-токеном (см. app/billing/client.py).
+    billing_base_url: str | None = None
+    billing_token: str | None = None
+    billing_timeout: float = 10.0
+    billing_mock: bool = False
+
     @classmethod
     def from_env(cls) -> Settings:
         return cls(
@@ -147,6 +153,10 @@ class Settings:
             external_media_encapsulation=_get_str("EXTERNAL_MEDIA_ENCAPSULATION", "audiosocket"),
             external_media_timeout=_get_float("EXTERNAL_MEDIA_TIMEOUT", 5.0),
             allow_unknown_sessions=_get_bool("ALLOW_UNKNOWN_SESSIONS", True),
+            billing_base_url=_get_optional_str("BILLING_BASE_URL"),
+            billing_token=_get_optional_str("BILLING_TOKEN"),
+            billing_timeout=_get_float("BILLING_TIMEOUT", 10.0),
+            billing_mock=_get_bool("BILLING_MOCK", False),
         )
 
     def with_overrides(self, **overrides: object) -> Settings:
@@ -161,6 +171,11 @@ class Settings:
     def ari_enabled(self) -> bool:
         """ARI-слой подключается только при полном наборе параметров."""
         return bool(self.ari_url and self.ari_user and self.ari_password and self.ari_app)
+
+    @property
+    def billing_enabled(self) -> bool:
+        """Биллинг готов: заданы адрес и токен либо включён BILLING_MOCK."""
+        return bool(self.billing_base_url and self.billing_token) or self.billing_mock
 
     @property
     def media_port(self) -> int:
@@ -183,7 +198,8 @@ class Settings:
         data: dict[str, object] = {}
         for field in self.__slots__:
             value = getattr(self, field)
-            data[field] = "***" if field == "ari_password" and value else value
+            secret = field in {"ari_password", "billing_token"}
+            data[field] = "***" if secret and value else value
         return data
 
 

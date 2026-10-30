@@ -3,6 +3,7 @@
     python -m app                  # настройки из .env, ARI включается автоматически
     python -m app --check          # проверить сценарий и промпты
     python -m app --ari-check      # проверить REST и WebSocket ARI
+    python -m app --billing-check 1  # запросить абонента в биллинге и выйти
     python -m app --no-ari         # автономный режим (без Asterisk, для отладки)
     python -m app --port 9093      # переопределить порт AudioSocket
 """
@@ -12,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import logging
 import signal
 import sys
@@ -23,6 +25,7 @@ from app.ari.events import AriEventStream
 from app.ari.manager import AriCallManager
 from app.audiosocket.registry import PendingRegistry
 from app.audiosocket.server import AudioSocketServer
+from app.billing.client import BillingClient, BillingError
 from app.config import Settings, load_settings
 from app.dialog.prompts import load_prompts
 from app.dialog.scenario import Scenario, ScenarioError
@@ -78,6 +81,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="проверить сценарий и промпты и выйти с кодом 0",
     )
+    parser.add_argument(
+        "--billing-check",
+        metavar="USER_ID",
+        default=None,
+        help="запросить абонента в биллинге по userId и выйти",
+    )
+    parser.add_argument(
+        "--billing-mock",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="отдавать тестовые данные биллинга без обращения к сети",
+    )
     return parser
 
 
@@ -94,6 +109,7 @@ def _resolve_settings(args: argparse.Namespace) -> Settings:
         external_media_host=args.external_media_host,
         external_media_port=args.external_media_port,
         allow_unknown_sessions=args.allow_unknown_sessions,
+        billing_mock=args.billing_mock,
     )
 
 
@@ -117,6 +133,28 @@ def _resolve_media_host(settings: Settings, log: logging.Logger) -> Settings:
 
 async def _noop_event(event: dict[str, Any]) -> None:
     return None
+
+
+async def _billing_check(settings: Settings, user_id: str, log: logging.Logger) -> int:
+    """Запросить абонента в биллинге и напечатать ответ (без запуска бота)."""
+    if not settings.billing_enabled:
+        log.error(
+            "биллинг не настроен: нужны BILLING_BASE_URL и BILLING_TOKEN "
+            "(или BILLING_MOCK=1/--billing-mock)"
+        )
+        return 2
+    async with BillingClient(settings, logger=log) as billing:
+        try:
+            subscriber = await billing.fetch_subscriber(user_id)
+        except BillingError as exc:
+            log.error("биллинг: %s", exc)
+            return 1
+    if subscriber is None:
+        log.info("биллинг: абонент %r не найден", user_id)
+        return 1
+    log.info("биллинг: абонент %r — %s", user_id, subscriber.summary)
+    print(json.dumps(subscriber.to_dict(), ensure_ascii=False, indent=2))
+    return 0
 
 
 async def _ari_check(settings: Settings, log: logging.Logger) -> int:
@@ -168,12 +206,29 @@ async def _serve(
     use_ari: bool,
 ) -> None:
     log = logging.getLogger("app")
+    billing_needed = any(step.billing for step in scenario.steps.values())
+    billing: BillingClient | None = None
+    if settings.billing_enabled:
+        billing = BillingClient(settings, logger=log)
+        await billing.start()
+        log.info(
+            "биллинг: %s%s",
+            settings.billing_base_url or "—",
+            " (BILLING_MOCK)" if settings.billing_mock else "",
+        )
+    elif billing_needed:
+        log.warning(
+            "в сценарии есть шаги с billing, но биллинг не настроен: "
+            "задайте BILLING_BASE_URL и BILLING_TOKEN (или BILLING_MOCK=1)"
+        )
+
     registry = PendingRegistry()
     server = AudioSocketServer(
         settings,
         scenario,
         prompts,
         registry=registry if use_ari else None,
+        billing=billing,
     )
     await server.start()
     addresses = ", ".join(local_ipv4_addresses()) or "нет внешних адресов"
@@ -210,6 +265,8 @@ async def _serve(
         if manager is not None:
             await manager.stop()
         await server.close()
+        if billing is not None:
+            await billing.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -220,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ошибка настроек: {exc}", file=sys.stderr)
         return 2
 
-    setup_logging(settings.log_level, secrets=(settings.ari_password,))
+    setup_logging(settings.log_level, secrets=(settings.ari_password, settings.billing_token))
     log = logging.getLogger("app")
     log.debug("настройки: %s", settings.masked())
 
@@ -240,6 +297,9 @@ def main(argv: list[str] | None = None) -> int:
             log.error("--ari-check требует настроенного ARI")
             return 2
         return asyncio.run(_ari_check(settings, log))
+
+    if args.billing_check is not None:
+        return asyncio.run(_billing_check(settings, args.billing_check, log))
 
     try:
         scenario = Scenario.load(settings.scenario_path)

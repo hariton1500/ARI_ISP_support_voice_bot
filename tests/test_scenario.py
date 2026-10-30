@@ -26,6 +26,37 @@ def test_default_scenario_is_valid() -> None:
     assert len(scenario.prompt_names) == len(set(scenario.prompt_names))
 
 
+def test_billing_step_is_parsed() -> None:
+    scenario = Scenario.from_dict(
+        _raw(
+            a={
+                "prompt": "a.wav",
+                "prompt_not_found": "nf.wav",
+                "prompt_error": "err.wav",
+                "billing": "caller",
+                "next": "a",
+            }
+        )
+    )
+    step = scenario.steps["a"]
+    assert step.billing == "caller"
+    assert step.prompt_not_found == "nf.wav"
+    assert step.prompt_error == "err.wav"
+    assert {"a.wav", "nf.wav", "err.wav"} <= set(scenario.prompt_names)
+
+
+def test_billing_prompts_require_billing() -> None:
+    with pytest.raises(ScenarioError, match="billing"):
+        Scenario.from_dict(_raw(a={"prompt": "a.wav", "prompt_not_found": "nf.wav"}))
+
+
+def test_default_scenario_asks_billing_for_balance() -> None:
+    scenario = Scenario.load(DEFAULT_SCENARIO)
+    assert scenario.steps["balance"].billing == "caller"
+    assert "balance_not_found.wav" in scenario.prompt_names
+    assert "balance_error.wav" in scenario.prompt_names
+
+
 def test_step_defaults() -> None:
     scenario = Scenario.from_dict(_raw(step={"prompt": "a.wav"}))
     step = scenario.steps["step"]

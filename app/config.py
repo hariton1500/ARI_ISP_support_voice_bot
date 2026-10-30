@@ -70,6 +70,13 @@ def _get_optional_str(name: str) -> str | None:
     return raw.strip()
 
 
+def _get_optional_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    return _get_int(name, 0)
+
+
 def _get_path(name: str, default: str) -> Path:
     raw = os.environ.get(name)
     path = Path(raw.strip()).expanduser() if raw and raw.strip() else Path(default)
@@ -99,11 +106,22 @@ class Settings:
 
     log_level: str
 
-    # ARI понадобится на следующем этапе (управление вызовом из Stasis).
+    # ARI: управление вызовом из Stasis (WebSocket + REST).
     ari_url: str | None = None
     ari_user: str | None = None
     ari_password: str | None = None
     ari_app: str | None = None
+
+    # ExternalMedia: адрес, по которому Asterisk подключается к нашему AudioSocket.
+    external_media_host: str | None = None
+    external_media_port: int | None = None
+    external_media_format: str = "slin"
+    external_media_transport: str = "tcp"
+    external_media_encapsulation: str = "audiosocket"
+    external_media_timeout: float = 5.0
+
+    # Разрешать AudioSocket-сессии без зарегистрированного вызова (автономный режим).
+    allow_unknown_sessions: bool = True
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -122,6 +140,13 @@ class Settings:
             ari_user=_get_optional_str("ARI_USER"),
             ari_password=_get_optional_str("ARI_PASSWORD"),
             ari_app=_get_optional_str("ARI_APP"),
+            external_media_host=_get_optional_str("EXTERNAL_MEDIA_HOST"),
+            external_media_port=_get_optional_int("EXTERNAL_MEDIA_PORT"),
+            external_media_format=_get_str("EXTERNAL_MEDIA_FORMAT", "slin"),
+            external_media_transport=_get_str("EXTERNAL_MEDIA_TRANSPORT", "tcp"),
+            external_media_encapsulation=_get_str("EXTERNAL_MEDIA_ENCAPSULATION", "audiosocket"),
+            external_media_timeout=_get_float("EXTERNAL_MEDIA_TIMEOUT", 5.0),
+            allow_unknown_sessions=_get_bool("ALLOW_UNKNOWN_SESSIONS", True),
         )
 
     def with_overrides(self, **overrides: object) -> Settings:
@@ -136,6 +161,22 @@ class Settings:
     def ari_enabled(self) -> bool:
         """ARI-слой подключается только при полном наборе параметров."""
         return bool(self.ari_url and self.ari_user and self.ari_password and self.ari_app)
+
+    @property
+    def media_port(self) -> int:
+        return self.external_media_port or self.audiosocket_port
+
+    @property
+    def ws_url(self) -> str:
+        """URL WebSocket-событий ARI, выведенный из ARI_URL."""
+        if not self.ari_url or not self.ari_app:
+            raise ValueError("ARI не настроен: нужны ARI_URL и ARI_APP")
+        base = self.ari_url.rstrip("/")
+        if base.startswith("https://"):
+            base = "wss://" + base[len("https://") :]
+        elif base.startswith("http://"):
+            base = "ws://" + base[len("http://") :]
+        return f"{base}/events?app={self.ari_app}"
 
     def masked(self) -> dict[str, object]:
         """Настройки для логов — без секретов."""

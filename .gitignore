@@ -1,5 +1,7 @@
 # Секреты
 .env
+# В этом файле рекомендации Asterisk с паролем ARI в открытом виде
+ari-ivr_ai.md
 
 # Python
 __pycache__/

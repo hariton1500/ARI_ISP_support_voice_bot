@@ -162,6 +162,25 @@ async def read_frame(
     return Frame(kind=kind, payload=payload)
 
 
+async def read_uuid_frame(reader: asyncio.StreamReader) -> uuid.UUID | None:
+    """Дождаться первого осмысленного фрейма: UUID канала или завершение.
+
+    Всё, что приходит до UUID (аудио, DTMF), игнорируется. None означает, что
+    соединение закрыто или Asterisk сообщил об ошибке.
+    """
+    while True:
+        frame = await read_frame(reader)
+        if frame is None:
+            return None
+        if frame.kind == FrameKind.UUID:
+            channel_uuid = frame.as_uuid()
+            if channel_uuid is None:
+                raise ConnectionError("фрейм UUID пришёл с некорректной длиной payload")
+            return channel_uuid
+        if frame.kind in {FrameKind.TERMINATE, FrameKind.ERROR}:
+            return None
+
+
 async def _read_exactly(
     reader: asyncio.StreamReader, size: int, timeout: float | None
 ) -> bytes | None:

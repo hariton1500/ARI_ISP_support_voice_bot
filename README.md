@@ -1,50 +1,70 @@
-# Голосовой бот службы поддержки абонентов (Asterisk + AudioSocket)
+# Голосовой бот службы поддержки абонентов (Asterisk ARI + AudioSocket)
 
-Бот для автоматического приёма звонков в службу поддержки оператора связи на
-русском языке. Общается с Asterisk по протоколу **AudioSocket**: Asterisk сам
-подключается к боту по TCP и передаёт звук в обе стороны.
+Бот принимает звонки на номер **777** и ведёт голосовое меню на русском языке.
+Управление вызовом идёт через **ARI** (WebSocket-события + REST), звук — через
+**ExternalMedia** с `encapsulation=audiosocket`: Asterisk сам подключается к
+боту по TCP и передаёт PCM 8 кГц в обе стороны.
 
-## Текущий этап
+## Как это работает
 
-Реализован **каркас без ИИ**:
-
-* TCP-сервер AudioSocket на asyncio (внешние зависимости — только `numpy` для
-  ресемплинга и `python-dotenv` для `.env`);
-* сценарий диалога в JSON: приветствие, голосовое меню, переходы по DTMF,
-  повтор шага при неверном вводе, таймауты, завершение вызова;
-* проигрывание WAV-промптов с реальным темпом (20 мс на фрейм) и
-  перебивание промпта нажатием цифры;
-* запись входящего звука в WAV + JSON-метаданные вызова;
-* тесты: протокол, аудио, сценарий, сквозной вызов через реальный сокет.
-
-Распознавание речи, синтез и LLM подключаются на следующем этапе — точки
-расширения заложены в структуре пакетов (`app/dialog`, `app/audio`).
-
-## Архитектура
+Сторона Asterisk (`sip2.evpanet.com`, Asterisk 22.5) уже настроена: звонок на 777
+попадает в Stasis-приложение `ivr_ai`. Менять диалплан не нужно.
 
 ```
-   абонент ──SIP/RTP──> Asterisk ──AudioSocket (TCP)──> Python-бот
-                            │                              │
-                            │  TCP: UUID, PCM 8 кГц,       ├─ сценарий диалога (JSON)
-                            │  DTMF                      ├─ промпты WAV → PCM
-                            ▼                              ├─ запись входящего звука
-                     канал связи                          └─ метрики/логи
+бот                                                    Asterisk 22.5
+── WS ws://…:8088/ari/events?app=ivr_ai ─────────────▶  держим постоянно
+◀─ StasisStart {channel.id, caller.number} ──────────  звонок на 777
+── POST /ari/channels/{caller}/answer ───────────────▶
+── POST /ari/bridges?type=mixing ────────────────────▶  bridgeId
+── POST /ari/channels/externalMedia?app=ivr_ai
+     &external_host=<наш адрес>:9092
+     &encapsulation=audiosocket&transport=tcp
+     &format=slin&data=<uuid> ────────────────────────▶  emId
+◀─ TCP-подключение от Asterisk ───────────────────────  1-й фрейм 0x01 = uuid
+── POST /ari/bridges/{bridgeId}/addChannel?channel=caller,em ▶
+◀─ ChannelDtmfReceived {digit} ───────────────────────  цифры приходят по ARI
+── DELETE /ari/channels/{caller}, /channels/{em}, /bridges/{bridgeId} ▶
 ```
 
-Ключевые особенности AudioSocket (подробнее — в
-[документации Asterisk](https://docs.asterisk.org/Configuration/Channel-Drivers/AudioSocket/)):
+Важные следствия:
+
+* **Пока WebSocket не подключён, звонок на 777 сразу завершается** — Asterisk не
+  знает, кому его отдать. Это первое, что нужно проверить при «вызов отклонён».
+* `POST /channels/{id}/continue` не используется: он выводит канал из Stasis.
+* DTMF в ARI-режиме читаются из события `ChannelDtmfReceived`. Asterisk
+  дублирует цифру ещё и фреймом `0x03` в AudioSocket — такие фреймы
+  игнорируются, иначе шаг срабатывает дважды (в автономном режиме фрейм
+  остаётся единственным источником цифр).
+* Связь TCP-соединения с вызовом — по `data=<uuid>`: Asterisk присылает его
+  первым фреймом. В ARI-режиме соединения с неизвестным UUID отклоняются.
+* Кодек — `slin`: 16 бит, моно, little-endian, **8 кГц**.
+
+Фреймы AudioSocket
+([документация](https://docs.asterisk.org/Configuration/Channel-Drivers/AudioSocket/)):
 
 | Фрейм | Назначение |
 |---|---|
 | `0x00` | завершение соединения (достаточно закрыть сокет) |
-| `0x01` | UUID канала — 16 бинарных байт |
-| `0x03` | DTMF-цифра (Asterisk 18+, один ASCII-байт) |
-| `0x10` | PCM 16 бит, моно, little-endian, 8 кГц (остальные `0x11`–`0x18` — 12…192 кГц) |
+| `0x01` | UUID — 16 бинарных байт |
+| `0x03` | DTMF-цифра (в ARI-режиме дублирует `ChannelDtmfReceived` и игнорируется) |
+| `0x10` | PCM 16 бит, моно, LE, 8 кГц (остальные `0x11`–`0x18` — 12…192 кГц) |
 | `0xFF` | ошибка |
 
-Заголовок фрейма — 3 байта: тип (1 байт) + длина payload (2 байта, big-endian).
-Приложение `AudioSocket(uuid,host:port)` **не отвечает** на вызов само, поэтому в
-диалплане обязателен `Answer()`.
+Заголовок — 3 байта: тип (1 байт) + длина payload (2 байта, big-endian).
+
+## Текущий этап
+
+* ARI-слой: WS-события с реконнектом, REST-команды, бридж, ExternalMedia,
+  привязка TCP к вызову, DTMF из ARI, очистка каналов/бриджа;
+* сценарий диалога в JSON: приветствие, меню, переходы по DTMF, повтор при
+  неверном вводе, таймауты, завершение вызова;
+* проигрывание WAV-промптов с реальным темпом (20 мс) и перебивание нажатием;
+* запись входящего звука в WAV + JSON-метаданные вызова;
+* 62 теста, включая сквозной прогон «StasisStart → ExternalMedia → TCP по UUID
+  → DTMF → очистка» на фейковом ARI.
+
+Распознавание речи, синтез и LLM — следующий этап (точки расширения:
+`app/dialog`, `app/audio`).
 
 ## Быстрый старт
 
@@ -53,84 +73,88 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 
-copy .env.example .env      # и впишите свои значения (секреты в git не попадают)
-python tools/make_placeholder_prompts.py   # заглушки промптов (тоны вместо речи)
-python -m app --check                      # проверка сценария и промптов
-python -m app                              # запуск: слушаем 0.0.0.0:9092
+copy .env.example .env          # впишите ARI_PASSWORD и EXTERNAL_MEDIA_HOST
+python tools/make_placeholder_prompts.py   # тоновые заглушки промптов
+python -m app --ari-check       # REST + WebSocket ARI
+python -m app --check           # сценарий и промпты
+python -m app                   # бот: ARI + AudioSocket
 ```
 
 Ожидаемый лог:
 
 ```
-2026-10-30 12:00:00 INFO  [app.audiosocket.server] AudioSocket слушает: ('0.0.0.0', 9092)
-2026-10-30 12:00:00 INFO  [app] бот готов: сценарий 'default' (10 шагов), промптов 9, порт 9092
+INFO [app.audiosocket.server] AudioSocket слушает: ('0.0.0.0', 9092)
+INFO [app] бот готов: сценарий 'default' (10 шагов), промптов 9, AudioSocket порт 9092, адреса: 172.18.185.162
+INFO [app.ari.events] ARI WebSocket подключён: ws://sip2.evpanet.com:8088/ari/events?app=ivr_ai
+INFO [app.ari.manager] ARI: приложение 'ivr_ai', события ws://…, ExternalMedia -> <адрес>:9092
 ```
 
-Проверка без Asterisk — тестами (они поднимают сервер на свободном порту):
+Полезные флаги: `--no-ari` (автономный режим без Asterisk), `--port`,
+`--external-media-host`, `--allow-unknown-sessions`, `--log-level DEBUG`.
+
+## Сетевое требование (обязательно)
+
+Asterisk подключается к боту сам, поэтому `EXTERNAL_MEDIA_HOST:EXTERNAL_MEDIA_PORT`
+должен быть **доступен с 91.195.230.13**:
+
+1. на роутере — проброс TCP-порта (по умолчанию 9092) на эту машину;
+2. в Windows — разрешить входящий TCP 9092 (PowerShell **от администратора**):
 
 ```powershell
-python -m pytest
+New-NetFirewallRule -DisplayName "ARI bot AudioSocket 9092" -Direction Inbound `
+  -Protocol TCP -LocalPort 9092 -Action Allow -Profile Any
 ```
 
-Либо «живьём» симулятором Asterisk: он подключается как АТС, слушает промпты и
-нажимает DTMF.
+3. в `.env` — внешний адрес/домен и **внешний** порт, если проброс не 1:1
+   (`EXTERNAL_MEDIA_PORT` — это порт, который набирает Asterisk).
+
+Проверка доставки (бот должен быть остановлен, порт свободен):
 
 ```powershell
-# терминал 1
-python -m app --port 9092
-# терминал 2
-python tools/simulate_call.py --digits 0 --save recordings/prompts.wav
+python tools/check_external_media.py --host <внешний-адрес> --port 9092
 ```
 
-Ожидаемый вывод симулятора:
+Инструмент открывает WebSocket ARI, просит Asterisk создать временный
+медиаканал на указанный адрес, ждёт TCP с нашим UUID и удаляет канал. Успех —
+`УСПЕХ: Asterisk подключился и прислал ожидаемый UUID`.
 
-```
-канал 6cfc6f50-...: подключились к 127.0.0.1:9092
--> DTMF 0
-фреймы от бота: {'AUDIO_8K': 161, 'TERMINATE': 1}
-получено аудио: 3.22 с
-промпты сохранены: recordings/prompts.wav
-```
+Порт 8088 (ARI) открывать не нужно — соединение инициируем мы; на стороне
+Asterisk наш IP уже в белом списке.
 
-## Подключение Asterisk
+## Диагностика
 
-1. Убедитесь, что загружен `chan_audiosocket` (см. `asterisk/modules.conf.sample`).
-2. Добавьте контекст из `asterisk/extensions.conf.sample`:
-
-```asterisk
-[ivr_ai]
-exten => 777,1,NoOp(IVR AI: входящий вызов от ${CALLERID(num)})
- same => n,Answer()
- same => n,Set(CHANNEL(language)=ru)
- same => n,AudioSocket(${UUID()},127.0.0.1:9092)
- same => n,Hangup()
-```
-
-3. Перезагрузите диалплан: `dialplan reload` (модуль: `module reload chan_audiosocket.so`).
-4. Позвоните на 777 — бот должен проиграть приветствие и меню.
-
-Адрес в `AudioSocket(...)` — это машина с ботом; порт должен совпадать с
-`AUDIOSOCKET_PORT`. Если Asterisk и бот на разных хостах, откройте порт в
-файрволе и ограничьте доступ по IP АТС: незашифрованный AudioSocket не
-аутентифицирован.
+| Симптом | Причина и что делать |
+|---|---|
+| звонок на 777 сразу обрывается | нет WS-подключения к ARI: бот не запущен / не настроен ARI / IP не в белом списке. Запустите `python -m app --ari-check` |
+| `externalMedia: 500` в логе | Asterisk не смог подключиться к `EXTERNAL_MEDIA_HOST:порт` — нет проброса или блокирует файрвол |
+| «externalMedia не подключился … за 5 с» | то же: TCP не дошёл до бота |
+| вызов идёт, но звука нет | проверьте `format=slin` и строку «медиапоток подключён»; смотрите лог шагов диалога |
+| «UUID … не связан ни с одним вызовом» | TCP пришёл с неизвестным `data`; в ARI-режиме такие соединения отклоняются |
+| «медиаканал … завершился (событие …), канал абонента ещё активен» | Asterisk закрыл `AudioSocket/…` раньше абонента: смотрите в логе АТС строки вокруг `Called …`/`is hung up`. Часто это вызов, завершённый на стороне оператора/провайдера |
 
 ## Настройки (.env)
 
 | Переменная | По умолчанию | Назначение |
 |---|---|---|
+| `ARI_URL` | — | `http://sip2.evpanet.com:8088/ari` |
+| `ARI_USER` / `ARI_PASSWORD` / `ARI_APP` | — | учётка и Stasis-приложение `ivr_ai` |
 | `AUDIOSOCKET_HOST` | `0.0.0.0` | адрес прослушивания AudioSocket |
-| `AUDIOSOCKET_PORT` | `9092` | порт AudioSocket (его указывают в диалплане) |
-| `SCENARIO_PATH` | `scenarios/default.json` | файл сценария диалога |
-| `PROMPTS_DIR` | `prompts/placeholder` | каталог промптов (для реальных записей — `prompts/ru`) |
-| `RECORDINGS_DIR` | `recordings` | каталог записей и метаданных |
-| `RECORD_CALLS` | `true` | писать входящий звук в WAV |
-| `INIT_TIMEOUT` | `10` | сколько ждать фрейм UUID от Asterisk, с |
-| `IDLE_TIMEOUT` | `30` | обрыв, если от АТС нет ни одного фрейма, с |
-| `MAX_CALL_SECONDS` | `600` | жёсткий лимит длительности вызова, с |
+| `AUDIOSOCKET_PORT` | `9092` | локальный порт AudioSocket |
+| `EXTERNAL_MEDIA_HOST` | — | адрес, доступный с Asterisk (`external_host`) |
+| `EXTERNAL_MEDIA_PORT` | = `AUDIOSOCKET_PORT` | порт, который набирает Asterisk |
+| `EXTERNAL_MEDIA_FORMAT` | `slin` | формат медиа (8 кГц, 16 бит, моно) |
+| `EXTERNAL_MEDIA_TIMEOUT` | `5` | ожидание TCP от Asterisk, с |
+| `ALLOW_UNKNOWN_SESSIONS` | `false` | принимать TCP без зарегистрированного вызова (отладка) |
+| `SCENARIO_PATH` | `scenarios/default.json` | файл сценария |
+| `PROMPTS_DIR` | `prompts/placeholder` | каталог промптов (реальные — `prompts/ru`) |
+| `RECORDINGS_DIR` | `recordings` | записи и метаданные |
+| `RECORD_CALLS` | `true` | писать входящий звук |
+| `INIT_TIMEOUT` | `10` | ожидание UUID в AudioSocket, с |
+| `IDLE_TIMEOUT` | `30` | обрыв при отсутствии фреймов, с |
+| `MAX_CALL_SECONDS` | `600` | лимит длительности вызова, с |
 | `LOG_LEVEL` | `INFO` | уровень логирования |
-| `ARI_URL`, `ARI_USER`, `ARI_PASSWORD`, `ARI_APP` | — | параметры ARI для следующего этапа |
 
-Пароль ARI маскируется в логах (фильтр `app.logging_setup.SecretFilter`).
+Пароль ARI маскируется в логах (`app.logging_setup.SecretFilter`).
 
 ## Сценарий диалога
 
@@ -156,53 +180,50 @@ exten => 777,1,NoOp(IVR AI: входящий вызов от ${CALLERID(num)})
 }
 ```
 
-Поля шага:
-
-| Поле | Смысл |
+| Поле шага | Смысл |
 |---|---|
-| `prompt` | имя файла промпта относительно `PROMPTS_DIR` |
-| `next` | переход после проигрывания промпта (если нет ожидания DTMF) |
+| `prompt` | файл промпта относительно `PROMPTS_DIR` |
+| `next` | переход после промпта (если не ждём DTMF) |
 | `dtmf` | карта «цифра → шаг» |
-| `timeout_ms` | сколько ждать цифру (по умолчанию 8000) |
-| `max_attempts` | сколько раз повторить шаг при неверном вводе (по умолчанию 2) |
-| `on_invalid` | шаг при неверной цифре после исчерпания попыток |
-| `on_timeout` | шаг при отсутствии ввода после исчерпания попыток |
+| `timeout_ms` | ожидание цифры (по умолчанию 8000) |
+| `max_attempts` | попытки при неверном вводе (по умолчанию 2) |
+| `on_invalid` | шаг после исчерпания попыток при неверной цифре |
+| `on_timeout` | шаг при отсутствии ввода |
 | `hangup` | завершить вызов после промпта |
 
-Логика ввода: верная цифра → переход по `dtmf`; неверная цифра или тишина →
-повтор шага; после `max_attempts` попыток → `on_invalid`/`on_timeout`
-(если нужного перехода нет — `on_timeout`, если нет и его — конец диалога).
-Сценарий валидируется при старте: неизвестные ссылки, кривые цифры и
-отрицательные таймауты дают понятную ошибку и код возврата 2.
+Верная цифра → переход по `dtmf`; неверная цифра или тишина → повтор шага;
+после `max_attempts` → `on_invalid`/`on_timeout` (если перехода нет —
+`on_timeout`, если нет и его — конец диалога). Сценарий валидируется при
+старте: неизвестные ссылки, кривые цифры и отрицательные таймауты дают ошибку
+и код возврата 2.
 
 ## Промпты
 
-Поддерживаются:
-
-* **WAV** (PCM 8/16/24/32 бита, любое число каналов, любая частота) —
-  приводится к 8 кГц, моно, 16 бит при загрузке;
+* **WAV** — PCM 8/16/24/32 бита, любое число каналов и любая частота
+  (приводится к 8 кГц, моно, 16 бит при загрузке);
 * **сырой PCM Asterisk**: `.sln` (8 кГц), `.sln16` (16 кГц), `.pcm`, `.raw`.
 
 `prompts/placeholder` — сгенерированные тоновые заглушки (в git не попадают).
-Реальные промпты диктора или TTS кладите в `prompts/ru` и указывайте
-`PROMPTS_DIR=prompts/ru`. Отсутствующий промпт не роняет бота: шаг просто
-прозвучит «в тишину», а в лог уйдёт предупреждение.
+Реальные записи диктора или TTS кладите в `prompts/ru` и указывайте
+`PROMPTS_DIR=prompts/ru`. Отсутствующий промпт не роняет бота: шаг прозвучит
+«в тишину», а в лог уйдёт предупреждение.
 
 ## Записи и метаданные
 
 На каждый вызов в `RECORDINGS_DIR` появляются:
 
-* `<uuid-канала>.wav` — входящий звук абонента (8 кГц, моно, 16 бит);
-* `<uuid-канала>.json` — сценарий, peer, время начала, длительность, число
-  аудиофреймов, набранные DTMF, пройденные шаги, причина завершения.
+* `<uuid>.wav` — входящий звук абонента (8 кГц, моно, 16 бит), где `uuid` —
+  значение `data` из ExternalMedia;
+* `<uuid>.json` — сценарий, канал ARI, номер абонента, время, длительность,
+  число аудиофреймов, DTMF, шаги, причина завершения.
 
 ```json
 {
   "session_id": "0c4c6b1e-...",
+  "channel_id": "1793357082.75",
+  "caller": "79001112233",
   "scenario": "default",
-  "peer": "10.10.0.15:5123",
   "duration_seconds": 24.7,
-  "audio_seconds": 24.6,
   "dtmf": "0",
   "steps": ["greeting", "menu", "operator"],
   "hangup_reason": "hangup_step",
@@ -211,67 +232,78 @@ exten => 777,1,NoOp(IVR AI: входящий вызов от ${CALLERID(num)})
 ```
 
 Причины завершения: `hangup_step`, `dialog_end`, `terminated`, `peer_closed`,
-`idle_timeout`, `max_duration`, `no_uuid`, `asterisk_error`,
-`connection_error`, `cancelled`, `error`.
+`idle_timeout`, `max_duration`, `asterisk_error`, `connection_error`,
+`cancelled`, `error`.
+
+## Проверка без АТС
+
+```powershell
+python -m pytest                 # 62 теста, фейковый ARI + реальный TCP
+```
+
+Автономный режим (без Asterisk, для отладки сценария):
+
+```powershell
+python -m app --no-ari --port 9092
+python tools/simulate_call.py --digits 0 --save recordings/prompts.wav
+```
+
+Симулятор подключается как АТС, слушает промпты и нажимает DTMF.
 
 ## Структура проекта
 
 ```
 app/
-  __main__.py            запуск (python -m app), флаг --check
-  config.py              настройки из .env и переменных окружения
-  logging_setup.py       логирование + маскирование секретов
+  __main__.py            запуск, --ari-check, --check, --no-ari
+  config.py              настройки из .env
+  logging_setup.py       логи + маскирование секретов
+  network.py             локальные IPv4 для подсказок
+  ari/
+    client.py            REST ARI (answer, bridges, externalMedia, delete)
+    events.py            WebSocket событий с реконнектом
+    manager.py           оркестрация вызова и очистка
   audiosocket/
-    protocol.py          фреймы AudioSocket: разбор и сборка
+    protocol.py          фреймы AudioSocket, чтение UUID
+    registry.py          связка «UUID ↔ вызов ARI»
     server.py            TCP-сервер, по сессии на соединение
-    session.py           вызов: приём фреймов, диалог, запись
-  audio/
-    pcm.py               PCM16, ресемплинг, загрузка WAV/sln
-    playback.py          проигрывание 20-мс фреймами, перебивание
-    recorder.py          запись входящего звука в WAV
-  dialog/
-    scenario.py          модель и валидация сценария
-    prompts.py           загрузка промптов сценария
-asterisk/                примеры extensions/modules/ari/http.conf
+    session.py           диалог, промпты, запись, DTMF
+  audio/                 PCM, ресемплинг, проигрыватель, запись
+  dialog/                сценарий и промпты
+asterisk/README.md       что настроено на стороне Asterisk
 scenarios/default.json   сценарий по умолчанию
 tools/
-  make_placeholder_prompts.py  генератор тоновых заглушек промптов
-  simulate_call.py             симулятор Asterisk для проверки без АТС
-tests/                   тесты, включая сквозной вызов по TCP
+  make_placeholder_prompts.py  заглушки промптов
+  simulate_call.py             симулятор АТС (автономный режим)
+  check_external_media.py      проверка доступности ExternalMedia
+tests/                   62 теста
 ```
 
 ## Тесты
 
 ```powershell
 python -m pytest
-python -m pytest tests/test_protocol.py -v
 ```
 
-Покрыто: форматирование/чтение фреймов, таймауты и обрывы, ресемплинг и WAV,
-проигрыватель с перебиванием, запись, валидация сценария, загрузка промптов,
-настройки, CLI и сквозной сценарий «подключились → услышали меню → нажали 0 →
-вызов завершён, запись и метаданные созданы».
-
-## Дальнейшие этапы
-
-1. **ARI-слой**: подключение к `ws://.../ari/events?app=ivr_ai`, обработка
-   `StasisStart`/`StasisEnd`/`ChannelDtmfReceived`, `POST /channels/{id}/continue`
-   на строку `AudioSocket(...)`, перевод на оператора через `redirect`/очередь.
-2. **Речь**: потоковый STT (ru), VAD и эндпоинтинг, TTS с выдачей 8 кГц,
-   barge-in по голосу, а не только по DTMF.
-3. **Диалог**: LLM + инструменты (баланс, статус услуги, заявка на выезд),
-   RAG по регламентам и базе знаний.
-4. **Эксплуатация**: PostgreSQL для логов диалогов, метрики latency/качества
-   распознавания, docker-compose с тестовым Asterisk, нагрузочные тесты.
+Покрыто: протокол и аудио, сценарий и промпты, настройки и CLI, ARI REST-клиент,
+реконнект WebSocket, реестр ожидающих вызовов, сквозной вызов
+«StasisStart → бридж → ExternalMedia → AudioSocket по UUID → DTMF → очистка»,
+отклонение неизвестного UUID, автономный режим с симулятором.
 
 ## Безопасность
 
 * `.env` в `.gitignore`; в репозитории только `.env.example`.
-* Пароль ARI, который ранее лежал в `.env` в открытом виде, **надо сменить** —
-  он уже был скомпрометирован.
-* ARI в примерах слушает `127.0.0.1`; для внешнего доступа включайте TLS
-  (`https`/`wss`) — иначе пароль и события вызова идут открытым текстом.
-* AudioSocket не аутентифицирован: порт бота должен быть доступен только с
-  адреса Asterisk.
+* `ari-ivr_ai.md` содержит пароль ARI в открытом виде — файл добавлен в
+  `.gitignore`; пароль **надо сменить**, он уже раскрыт.
+* По требованию Asterisk HTTP/WS работают без TLS, доступ — только по белому
+  списку IP, поэтому пароль нельзя публиковать.
+* AudioSocket не аутентифицирован: разрешайте входящие соединения только с
+  `91.195.230.13`.
 * Записи разговоров содержат персональные данные — ограничьте доступ к
-  `RECORDINGS_DIR` и задайте срок хранения согласно политике оператора.
+  `RECORDINGS_DIR` и задайте срок хранения.
+
+## Дальнейшие этапы
+
+1. STT/TTS на русском (потоково), VAD и эндпоинтинг, barge-in по голосу.
+2. LLM + инструменты (баланс, статус услуги, заявка на выезд), RAG по регламентам.
+3. PostgreSQL для логов диалогов, метрики задержек, docker-compose с тестовой АТС.
+4. Перевод на TLS-эндпоинт ARI, когда провайдер его включит.

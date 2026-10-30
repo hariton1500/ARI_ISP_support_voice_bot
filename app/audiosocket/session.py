@@ -36,6 +36,7 @@ from app.audiosocket.protocol import (
     encode_terminate,
     read_frame,
 )
+from app.audiosocket.registry import PendingCall
 from app.config import Settings
 from app.dialog.prompts import PromptMap
 from app.dialog.scenario import Scenario, Step
@@ -110,6 +111,8 @@ class CallSession:
         scenario: Scenario,
         prompts: PromptMap,
         *,
+        channel_uuid: uuid_module.UUID,
+        pending: PendingCall | None = None,
         logger: logging.Logger | None = None,
         peer: str | None = None,
     ) -> None:
@@ -120,6 +123,9 @@ class CallSession:
         self._prompts = prompts
         self._log = logger or logging.getLogger("app.session")
         self._peer = peer
+        self._channel_uuid = channel_uuid
+        self._pending = pending
+        self._channel_id: str | None = None
 
         self.session_id: str | None = None
         self._digits = DigitBuffer()
@@ -141,15 +147,22 @@ class CallSession:
     async def run(self) -> None:
         """Обработать вызов до завершения диалога или обрыва соединения."""
         try:
-            channel_uuid = await asyncio.wait_for(
-                self._read_initial_uuid(), timeout=self._settings.init_timeout
-            )
-            if channel_uuid is None:
-                self._stats.hangup_reason = "no_uuid"
-                return
-            self.session_id = str(channel_uuid)
+            if self._pending is not None:
+                self.session_id = self._pending.uuid
+                self._channel_id = self._pending.channel_id
+                for digit in self._pending.drain_digits():
+                    self._digits.push(digit)
+            else:
+                self.session_id = str(self._channel_uuid)
             self._open_recorder()
-            self._log.info("вызов %s: диалог начат (peer=%s)", self.session_id, self._peer or "?")
+            if self._pending is not None:
+                self._pending.attach(self)
+            self._log.info(
+                "вызов %s: диалог начат (канал=%s, peer=%s)",
+                self.session_id,
+                self._channel_id or "-",
+                self._peer or "?",
+            )
             self._read_task = asyncio.create_task(
                 self._read_frames(), name=f"audiosocket-read-{self.session_id}"
             )
@@ -163,16 +176,12 @@ class CallSession:
             self._stats.hangup_reason = "cancelled"
             raise
         except asyncio.TimeoutError:
-            if self.session_id is None:
-                self._stats.hangup_reason = "no_uuid"
-                self._log.warning("вызов без UUID: Asterisk не прислал фрейм 0x01")
-            else:
-                self._stats.hangup_reason = "max_duration"
-                self._log.warning(
-                    "вызов %s: превышена максимальная длительность %.0f с",
-                    self.session_id,
-                    self._settings.max_call_seconds,
-                )
+            self._stats.hangup_reason = "max_duration"
+            self._log.warning(
+                "вызов %s: превышена максимальная длительность %.0f с",
+                self.session_id,
+                self._settings.max_call_seconds,
+            )
         except ConnectionAbortedError:
             self._stats.hangup_reason = "peer_closed"
         except (ConnectionError, OSError) as exc:
@@ -193,26 +202,6 @@ class CallSession:
             self._writer.close()
 
     # ------------------------------------------------------- приём фреймов
-
-    async def _read_initial_uuid(self) -> uuid_module.UUID | None:
-        """Дождаться первого осмысленного фрейма: 0x01 (UUID) или 0x00."""
-        while True:
-            frame = await read_frame(self._reader)
-            if frame is None:
-                return None
-            if frame.kind == FrameKind.UUID:
-                channel_uuid = frame.as_uuid()
-                if channel_uuid is None:
-                    raise ConnectionError("фрейм UUID пришёл с некорректной длиной payload")
-                return channel_uuid
-            if frame.kind == FrameKind.TERMINATE:
-                return None
-            if frame.kind == FrameKind.ERROR:
-                self._log.warning(
-                    "Asterisk сообщил об ошибке AudioSocket: %s", frame.payload.hex() or "без кода"
-                )
-                return None
-            self._log.debug("до UUID получен фрейм %s — игнорируем", frame.kind_name)
 
     async def _read_frames(self) -> None:
         """Читать фреймы до конца соединения и разбудить диалог при обрыве."""
@@ -263,21 +252,39 @@ class CallSession:
             pcm = resample(pcm, rate, SAMPLE_RATE)
         if not pcm:
             return
+        if self._stats.audio_frames == 0:
+            self._log.info("вызов %s: пошёл звук от абонента", self.session_id)
         self._stats.audio_frames += 1
         self._stats.audio_bytes += len(pcm)
         if self._recorder is not None:
             self._recorder.write(pcm)
 
-    def _on_dtmf(self, frame: Frame) -> None:
-        digit = frame.as_dtmf()
-        if digit is None:
-            self._log.debug("вызов %s: некорректный DTMF-фрейм %r", self.session_id, frame.payload)
+    def push_digit(self, digit: str) -> None:
+        """Принять DTMF-цифру: из фрейма AudioSocket или события ARI."""
+        if self._closed or not digit:
             return
         self._stats.dtmf_digits.append(digit)
         self._log.info("вызов %s: DTMF %r", self.session_id, digit)
         if self._player.is_playing:
             self._player.stop()
         self._digits.push(digit)
+
+    def _on_dtmf(self, frame: Frame) -> None:
+        digit = frame.as_dtmf()
+        if digit is None:
+            self._log.debug("вызов %s: некорректный DTMF-фрейм %r", self.session_id, frame.payload)
+            return
+        if self._pending is not None:
+            # В ARI-режиме Asterisk присылает цифру дважды: фреймом AudioSocket и
+            # событием ChannelDtmfReceived. Источник истины — ARI, иначе шаг
+            # сработает повторно на возврате в меню.
+            self._log.debug(
+                "вызов %s: DTMF %r из AudioSocket пропущен (используем событие ARI)",
+                self.session_id,
+                digit,
+            )
+            return
+        self.push_digit(digit)
 
     async def _send_audio(self, pcm: bytes) -> None:
         if self._closed:
@@ -410,6 +417,8 @@ class CallSession:
         duration = time.monotonic() - self._stats.started_at
         payload = {
             "session_id": self.session_id,
+            "channel_id": self._channel_id,
+            "caller": self._pending.caller_number if self._pending else None,
             "scenario": self._scenario.name,
             "peer": self._peer,
             "started_at": self._stats.started_wall.isoformat(),
@@ -455,9 +464,15 @@ class CallSession:
             self._writer.close()
             await asyncio.wait_for(self._writer.wait_closed(), timeout=1.0)
 
+        if self._pending is not None:
+            # Завершаем вызов на стороне Asterisk: DELETE каналов и бриджа.
+            with contextlib.suppress(Exception):
+                await self._pending.close(self._stats.hangup_reason)
+
         self._log.info(
-            "вызов %s: завершён (причина=%s, шаги=%s, DTMF=%s, аудио=%.1f с, запись=%s)",
+            "вызов %s: завершён (канал=%s, причина=%s, шаги=%s, DTMF=%s, аудио=%.1f с, запись=%s)",
             self.session_id,
+            self._channel_id or "-",
             self._stats.hangup_reason,
             "->".join(self._stats.steps) or "-",
             "".join(self._stats.dtmf_digits) or "-",

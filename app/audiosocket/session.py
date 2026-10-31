@@ -459,7 +459,18 @@ class CallSession:
         """Проиграть шаг и вернуть имя следующего шага (None — конец диалога)."""
         prompt = await self._resolve_prompt(step)
         if step.llm:
-            return await self._run_llm_step(step, prompt)
+            if self._llm is not None:
+                return await self._run_llm_step(step, prompt)
+            self._log.warning(
+                "вызов %s: шаг %s, LLM не настроена (нужен AITUNNEL_API_KEY) — "
+                "работают только DTMF/voice",
+                self.session_id,
+                step.name,
+            )
+        return await self._run_input_step(step, prompt)
+
+    async def _run_input_step(self, step: Step, prompt: str | None) -> str | None:
+        """Обычный шаг: промпт, DTMF/voice, повторы и fallback."""
         attempts = 0
         while True:
             if self._closed:
@@ -534,24 +545,23 @@ class CallSession:
 
         DTMF и `voice`-команды сценария остаются быстрыми переходами. Всё
         остальное уходит модели; её ответ озвучивается через TTS, а barge-in
-        работает так же, как для обычного промпта.
+        работает так же, как для обычного промпта. При тишине или неизвестной
+        цифре промпт повторяется до `max_attempts`, затем срабатывает
+        `on_timeout`/`on_invalid`.
         """
+        if self._llm is None:
+            return await self._run_input_step(step, prompt)
+
         await self._play_prompt(step, prompt)
         if self._closed:
             raise ConnectionAbortedError("вызов завершён")
         if step.hangup:
             return None
-        if self._llm is None:
-            self._log.warning(
-                "вызов %s: шаг %s, LLM не настроена (нужен AITUNNEL_API_KEY) — "
-                "работают только DTMF/voice",
-                self.session_id,
-                step.name,
-            )
-            return step.on_invalid or step.on_timeout
 
         tools = VoiceTools(self._billing, logger=self._log)
         conversation = self._llm.conversation(tools)
+        silent_attempts = 0
+        invalid_attempts = 0
 
         while not self._closed:
             digit, text = await self._wait_input(step)
@@ -566,22 +576,55 @@ class CallSession:
                         target,
                     )
                     return target
+
+                invalid_attempts += 1
+                if invalid_attempts >= step.max_attempts:
+                    self._log.info(
+                        "вызов %s: шаг %s (LLM), цифра %r без перехода, "
+                        "попытки исчерпаны -> %s",
+                        self.session_id,
+                        step.name,
+                        digit,
+                        step.on_invalid or step.on_timeout or "завершение вызова",
+                    )
+                    return step.on_invalid or step.on_timeout
+
                 self._log.info(
-                    "вызов %s: шаг %s (LLM), цифра %r без перехода",
+                    "вызов %s: шаг %s (LLM), цифра %r без перехода "
+                    "(попытка %d из %d)",
                     self.session_id,
                     step.name,
                     digit,
+                    invalid_attempts,
+                    step.max_attempts,
                 )
-                return step.on_invalid or step.on_timeout
+                await self._play_prompt(step, prompt)
+                continue
 
             if text is None:
+                silent_attempts += 1
+                if silent_attempts >= step.max_attempts:
+                    self._log.info(
+                        "вызов %s: шаг %s (LLM), нет ввода за %d мс, "
+                        "попытки исчерпаны -> %s",
+                        self.session_id,
+                        step.name,
+                        step.timeout_ms,
+                        step.on_timeout or "завершение вызова",
+                    )
+                    return step.on_timeout
+
                 self._log.info(
-                    "вызов %s: шаг %s (LLM), нет ввода за %d мс",
+                    "вызов %s: шаг %s (LLM), нет ввода за %d мс "
+                    "(попытка %d из %d)",
                     self.session_id,
                     step.name,
                     step.timeout_ms,
+                    silent_attempts,
+                    step.max_attempts,
                 )
-                return step.on_timeout
+                await self._play_prompt(step, prompt)
+                continue
 
             target = match_voice(text, step.dtmf, step.voice)
             if target is not None:
@@ -594,6 +637,8 @@ class CallSession:
                 )
                 return target
 
+            silent_attempts = 0
+            invalid_attempts = 0
             self._log.info("вызов %s: LLM запрос: %r", self.session_id, text)
             before = getattr(conversation, "tool_calls", 0)
             try:

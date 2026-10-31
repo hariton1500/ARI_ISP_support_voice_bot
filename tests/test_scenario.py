@@ -10,6 +10,7 @@ from app.config import PROJECT_ROOT
 from app.dialog.scenario import Scenario, ScenarioError
 
 DEFAULT_SCENARIO = PROJECT_ROOT / "scenarios" / "default.json"
+LLM_FIRST_SCENARIO = PROJECT_ROOT / "scenarios" / "llm-first.json"
 
 
 def _raw(**steps: dict) -> dict:
@@ -24,6 +25,35 @@ def test_default_scenario_is_valid() -> None:
     assert scenario.steps["menu"].llm is True
     assert scenario.steps["operator"].hangup is True
     assert "menu.wav" in scenario.prompt_names
+    assert len(scenario.prompt_names) == len(set(scenario.prompt_names))
+
+
+def test_llm_first_scenario_is_valid() -> None:
+    scenario = Scenario.load(LLM_FIRST_SCENARIO)
+    assert scenario.name == "llm-first"
+    assert scenario.initial == "greeting"
+    assert "menu" not in scenario.steps
+    assert scenario.steps["greeting"].next == "dialog"
+
+    dialog = scenario.steps["dialog"]
+    assert dialog.llm is True
+    assert dialog.dtmf == {
+        "1": "balance",
+        "2": "tech_support",
+        "3": "payment",
+        "0": "operator",
+    }
+    assert dialog.voice["оператор"] == "operator"
+    assert dialog.on_timeout == "no_input"
+    assert scenario.steps["no_input"].next == "fallback"
+    assert scenario.steps["operator"].hangup is True
+    assert "dialog.wav" in scenario.prompt_names
+
+
+def test_llm_first_scenario_has_billing_and_no_duplicate_prompts() -> None:
+    scenario = Scenario.load(LLM_FIRST_SCENARIO)
+    assert scenario.steps["balance"].billing == "caller"
+    assert scenario.steps["balance"].next == "dialog"
     assert len(scenario.prompt_names) == len(set(scenario.prompt_names))
 
 

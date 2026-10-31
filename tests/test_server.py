@@ -24,7 +24,7 @@ from app.audiosocket.protocol import (
 from app.audiosocket.registry import PendingCall, PendingRegistry
 from app.audiosocket.server import AudioSocketServer
 from app.billing.client import BillingError, Subscriber
-from app.config import Settings
+from app.config import PROJECT_ROOT, Settings
 from app.dialog.prompts import PromptMap, load_prompts
 from app.dialog.scenario import Scenario
 from app.llm.conversation import LLMReply
@@ -328,7 +328,9 @@ def _silence_frame() -> bytes:
     return b"\x00" * 320
 
 
-def _voice_scenario(text_only: bool = False, llm: bool = False) -> Scenario:
+def _voice_scenario(
+    text_only: bool = False, llm: bool = False, timeout_ms: int = 3000
+) -> Scenario:
     greeting: dict[str, Any] = (
         {"text": "Здравствуйте! Это служба поддержки.", "hangup": True}
         if text_only
@@ -343,7 +345,7 @@ def _voice_scenario(text_only: bool = False, llm: bool = False) -> Scenario:
                 "menu": {
                     "prompt": "menu.wav",
                     "llm": llm,
-                    "timeout_ms": 3000,
+                    "timeout_ms": timeout_ms,
                     "max_attempts": 2,
                     "dtmf": {"0": "operator", "1": "operator"},
                     "voice": {"оператор": "operator", "соедините с оператором": "operator"},
@@ -376,13 +378,21 @@ def _voice_settings(tmp_path: Path, prompts_dir: Path) -> Settings:
 
 
 async def _voice_flow(
-    tmp_path: Path, speech: _FakeSpeech, llm: Any = None
+    tmp_path: Path,
+    speech: _FakeSpeech,
+    llm: Any = None,
+    scenario: Scenario | None = None,
 ) -> dict[str, Any]:
-    scenario = _voice_scenario(llm=llm is not None)
     prompts_dir = tmp_path / "voice-prompts"
-    write_wav(prompts_dir / "greeting.wav", duration_ms=1000)
-    write_wav(prompts_dir / "menu.wav", duration_ms=200)
-    write_wav(prompts_dir / "operator.wav", duration_ms=100)
+    if scenario is None:
+        scenario = _voice_scenario(llm=llm is not None)
+        write_wav(prompts_dir / "greeting.wav", duration_ms=1000)
+        write_wav(prompts_dir / "menu.wav", duration_ms=200)
+        write_wav(prompts_dir / "operator.wav", duration_ms=100)
+    else:
+        for name in scenario.prompt_names:
+            write_wav(prompts_dir / name, duration_ms=200)
+        write_wav(prompts_dir / "greeting.wav", duration_ms=1000)
     prompts = load_prompts(scenario, prompts_dir)
     settings = _voice_settings(tmp_path, prompts_dir)
 
@@ -510,3 +520,98 @@ def test_llm_step_answers_free_speech_and_ends_call(tmp_path: Path) -> None:
     assert meta["hangup_reason"] == "llm_end_call"
     assert meta["steps"] == ["greeting", "menu"]
     assert meta["tts_characters"] == len("Тарифы уточняются по адресу. Всего доброго!")
+
+
+def test_llm_first_scenario_answers_free_speech_without_menu(tmp_path: Path) -> None:
+    scenario = Scenario.load(PROJECT_ROOT / "scenarios" / "llm-first.json")
+    text = "Расскажите, какие у вас тарифы"
+    speech = _FakeSpeech(text=text, tts_pcm=b"\x01\x00" * 80)
+    llm = _FakeLLM()
+
+    meta = asyncio.run(_voice_flow(tmp_path, speech, llm=llm, scenario=scenario))
+
+    assert llm.questions == [text]
+    assert meta["steps"] == ["greeting", "dialog"]
+    assert meta["transcripts"] == [text]
+    assert meta["llm_turns"] == 1
+    assert meta["hangup_reason"] == "llm_end_call"
+
+
+async def _llm_disabled_flow(tmp_path: Path) -> dict[str, Any]:
+    """Сценарий с LLM-шагом, но без настроенной LLM: DTMF должен работать."""
+    scenario = _voice_scenario(llm=True)
+    prompts_dir = tmp_path / "llm-disabled-prompts"
+    write_wav(prompts_dir / "greeting.wav", duration_ms=1000)
+    write_wav(prompts_dir / "menu.wav", duration_ms=200)
+    write_wav(prompts_dir / "operator.wav", duration_ms=100)
+    prompts = load_prompts(scenario, prompts_dir)
+    settings = _voice_settings(tmp_path, prompts_dir)
+
+    channel_uuid = uuid.uuid4()
+    server = AudioSocketServer(settings, scenario, prompts, speech=None, llm=None)
+    await server.start()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.bound_port)
+        writer.write(encode_frame(FrameKind.UUID, channel_uuid.bytes))
+        await writer.drain()
+        await asyncio.sleep(0.1)
+        writer.write(encode_dtmf("0"))
+        await writer.drain()
+        await _read_until_eof(reader, timeout=10.0)
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    finally:
+        await server.close()
+
+    return json.loads(
+        (settings.recordings_dir / f"{channel_uuid}.json").read_text(encoding="utf-8")
+    )
+
+
+def test_llm_step_without_backend_still_handles_dtmf(tmp_path: Path) -> None:
+    meta = asyncio.run(_llm_disabled_flow(tmp_path))
+
+    assert meta["steps"] == ["greeting", "menu", "operator"]
+    assert meta["dtmf"] == "0"
+    assert meta["llm_turns"] == 0
+    assert meta["hangup_reason"] == "hangup_step"
+
+
+async def _llm_timeout_flow(tmp_path: Path) -> dict[str, Any]:
+    """LLM-шаг без ввода: повторить промпт и уйти по on_timeout."""
+    scenario = _voice_scenario(llm=True, timeout_ms=120)
+    prompts_dir = tmp_path / "llm-timeout-prompts"
+    write_wav(prompts_dir / "greeting.wav", duration_ms=1000)
+    write_wav(prompts_dir / "menu.wav", duration_ms=200)
+    write_wav(prompts_dir / "operator.wav", duration_ms=100)
+    prompts = load_prompts(scenario, prompts_dir)
+    settings = _voice_settings(tmp_path, prompts_dir)
+
+    channel_uuid = uuid.uuid4()
+    server = AudioSocketServer(
+        settings, scenario, prompts, speech=None, llm=_FakeLLM()
+    )
+    await server.start()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.bound_port)
+        writer.write(encode_frame(FrameKind.UUID, channel_uuid.bytes))
+        await writer.drain()
+        await _read_until_eof(reader, timeout=10.0)
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    finally:
+        await server.close()
+
+    return json.loads(
+        (settings.recordings_dir / f"{channel_uuid}.json").read_text(encoding="utf-8")
+    )
+
+
+def test_llm_step_repeats_prompt_then_uses_timeout_fallback(tmp_path: Path) -> None:
+    meta = asyncio.run(_llm_timeout_flow(tmp_path))
+
+    assert meta["steps"] == ["greeting", "menu", "operator"]
+    assert meta["llm_turns"] == 0
+    assert meta["hangup_reason"] == "hangup_step"

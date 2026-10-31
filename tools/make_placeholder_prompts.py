@@ -25,6 +25,7 @@ GAP_MS = 60
 PLACEHOLDERS: dict[str, tuple[tuple[int, ...], int]] = {
     "greeting": ((440,), 200),
     "menu": ((440, 660), 200),
+    "dialog": ((440, 660, 880), 200),
     "invalid_digit": ((330, 330, 330), 120),
     "no_input": ((300, 300), 180),
     "balance": ((440, 550, 660, 770), 160),

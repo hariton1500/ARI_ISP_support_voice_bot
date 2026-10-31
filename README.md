@@ -56,8 +56,9 @@
 
 * ARI-слой: WS-события с реконнектом, REST-команды, бридж, ExternalMedia,
   привязка TCP к вызову, DTMF из ARI, очистка каналов/бриджа;
-* сценарий диалога в JSON: приветствие, меню, переходы по DTMF и по голосу,
-  повтор при неверном вводе, таймауты, завершение вызова;
+* два сценария в JSON: `default.json` с озвученным меню и `llm-first.json`
+  без меню — свободный диалог, скрытые DTMF-переходы, повтор при тишине
+  и завершение вызова;
 * проигрывание WAV-промптов с реальным темпом (20 мс) и перебивание нажатием;
 * **STT/TTS на русском через AITUNNEL**: распознавание реплик, синтез `text`-
   шагов в PCM-поток, VAD и эндпоинтинг по тишине, barge-in по голосу;
@@ -70,9 +71,10 @@
   число barge-in, объём TTS и LLM-реплики);
 * запрос в биллинг по `userId` (баланс, тариф, дни, состояние сети) на шаге
   `balance`; результат уходит в лог и в метаданные вызова;
-* 118 тестов, включая сквозной прогон «StasisStart → ExternalMedia → TCP по UUID
+* 123 теста, включая сквозной прогон «StasisStart → ExternalMedia → TCP по UUID
   → DTMF/голос → очистка» на фейковом ARI, контракт биллинга, fake-сервер
-  AITUNNEL (STT multipart, TTS-поток, ресемплинг) и LLM function calling.
+  AITUNNEL (STT multipart, TTS-поток, ресемплинг), LLM function calling
+  и fallback LLM-шага без ключа/при тишине.
 
 RAG с поиском по фрагментам и PostgreSQL для логов — следующие этапы (точки
 расширения: `app/llm`, `app/dialog`).
@@ -93,6 +95,7 @@ python -m app --stt-check recordings/<id>.wav      # AITUNNEL STT -> текст
 python -m app --llm-check "Какие тарифы в Евпатории?" # LLM + инструменты
 python -m app --check           # сценарий, промпты, LLM-промпты
 python -m app                   # бот: ARI + AudioSocket + речь
+python -m app --scenario scenarios/llm-first.json  # LLM-first без меню
 ```
 
 Ожидаемый лог:
@@ -108,7 +111,7 @@ INFO [app.ari.manager] ARI: приложение 'ivr_ai', события ws://�
 `--external-media-host`, `--allow-unknown-sessions`, `--log-level DEBUG`,
 `--billing-check USER_ID`, `--billing-mock`, `--tts-check TEXT`,
 `--stt-check AUDIO`, `--llm-check TEXT`, `--tts-output PATH`,
-`--llm-prompts-dir PATH`.
+`--llm-prompts-dir PATH`, `--scenario PATH`.
 
 ## Сетевое требование (обязательно)
 
@@ -207,7 +210,8 @@ Asterisk наш IP уже в белом списке.
 
 ## Сценарий диалога
 
-Сценарий — JSON с именованными шагами (`scenarios/default.json`):
+Сценарий — JSON с именованными шагами. Основной вариант с озвученным меню —
+`scenarios/default.json`; вариант без меню — `scenarios/llm-first.json`.
 
 ```json
 {
@@ -241,7 +245,7 @@ Asterisk наш IP уже в белом списке.
 | `voice` | карта «фраза → шаг» для распознанной речи |
 | `llm` | `true` — свободный диалог через LLM; DTMF/`voice` остаются быстрыми переходами |
 | `timeout_ms` | ожидание ввода (по умолчанию 8000) |
-| `max_attempts` | попытки при неверном вводе (по умолчанию 2) |
+| `max_attempts` | попытки при неверном вводе/тишине (по умолчанию 2) |
 | `on_invalid` | шаг после исчерпания попыток при неверной цифре/фразе |
 | `on_timeout` | шаг при отсутствии ввода |
 | `hangup` | завершить вызов после промпта |
@@ -259,8 +263,29 @@ Asterisk наш IP уже в белом списке.
 Если у шага `"llm": true`, после промпта включается свободный диалог: сначала
 проверяются `dtmf` и `voice`, а незнакомая фраза уходит LLM. Модель может
 вызвать инструмент и продолжить разговор; `end_call` завершает вызов,
-`transfer_to_operator` уводит на шаг `operator` (если он есть). Без
-`AITUNNEL_API_KEY` шаг работает как обычный: только DTMF/`voice`.
+`transfer_to_operator` уводит на шаг `operator` (если он есть). При тишине
+промпт повторяется, после `max_attempts` срабатывает `on_timeout`; неверная
+цифра обрабатывается так же через `on_invalid`. Без `AITUNNEL_API_KEY` шаг
+работает как обычный: только DTMF/`voice`.
+
+### LLM-first без озвученного меню
+
+`scenarios/llm-first.json` убирает отдельный шаг `menu` и перечисление опций:
+после `greeting.wav` играется короткий `dialog.wav` («Чем я могу помочь?»),
+дальше работает LLM. DTMF остаётся **скрытым** ускоренным путём:
+
+* `1` — баланс, `2` — техподдержка, `3` — оплата, `0` — оператор;
+* `voice` содержит только явный перевод на оператора;
+* после двух периодов тишины `no_input` ведёт на `fallback`, а не в меню;
+* баланс по DTMF по-прежнему идёт через шаг `balance` с запросом в биллинг.
+
+Включается флагом `--scenario scenarios/llm-first.json` или
+`SCENARIO_PATH=scenarios/llm-first.json` в `.env`. Основной `default.json`
+остаётся для сравнения и отката. `python tools/make_placeholder_prompts.py`
+создаёт и `dialog.wav`; если файла нет, вопрос озвучивается через TTS из
+поля `text`. Реальный `dialog.wav` можно записать через
+`--tts-check "Чем я еще могу помочь?" --tts-output prompts/placeholder/dialog.wav`;
+повторный запуск генератора заглушек перезапишет его тоном.
 
 ## Речь: STT/TTS, VAD и barge-in (AITUNNEL)
 
@@ -306,9 +331,10 @@ barge-in может срабатывать ложно. В таком случа�
 ## LLM и инструменты (AITUNNEL)
 
 Свободный диалог включается у шага с `"llm": true` (в `scenarios/default.json`
-это `menu`). Сначала работают быстрые DTMF/`voice`-переходы, затем незнакомая
-фраза уходит в `POST /chat/completions` AITUNNEL. Ответ модели очищается от
-markdown и озвучивается потоковым TTS; barge-in работает как для промпта.
+это `menu`, в `scenarios/llm-first.json` — `dialog`). Сначала работают быстрые
+DTMF/`voice`-переходы, затем незнакомая фраза уходит в `POST /chat/completions`
+AITUNNEL. Ответ модели очищается от markdown и озвучивается потоковым TTS;
+barge-in работает как для промпта.
 
 Промпты лежат в `prompts/llm/` и передаются модели как system-сообщение:
 
@@ -338,8 +364,10 @@ markdown и озвучивается потоковым TTS; barge-in работ
   `LLM_MAX_TOOL_ROUNDS`;
 * при недоступности LLM бот говорит «Извините, произошла техническая ошибка.
   Перевожу вас на оператора» и уходит на шаг `operator`;
-* без `AITUNNEL_API_KEY` остаются DTMF и `voice`-команды, LLM-шаг не ломает
-  вызов;
+* без `AITUNNEL_API_KEY` LLM-шаг автоматически работает как обычный: DTMF и
+  `voice`-команды продолжают обслуживать вызов;
+* при тишине промпт LLM-шага повторяется до `max_attempts`, затем срабатывает
+  `on_timeout` (в `llm-first` — `no_input` → `fallback`);
 * в `<uuid>.json` пишутся `llm_turns`, `llm_tool_calls`, `llm_errors`,
   `llm_replies`.
 
@@ -449,7 +477,7 @@ python -m app --billing-check 1 --billing-mock   # тестовые данные
 ## Проверка без АТС
 
 ```powershell
-python -m pytest                 # 118 тестов: ARI, TCP, биллинг, речь/VAD, LLM
+python -m pytest                 # 123 теста: ARI, TCP, биллинг, речь/VAD, LLM
 ```
 
 Автономный режим (без Asterisk, для отладки сценария):
@@ -492,13 +520,14 @@ app/
   audio/                 PCM, ресемплинг, проигрыватель, запись
   dialog/                сценарий, промпты, голосовые интенты
 asterisk/README.md       что настроено на стороне Asterisk
-scenarios/default.json   сценарий по умолчанию
+scenarios/default.json   сценарий по умолчанию (меню + LLM)
+scenarios/llm-first.json сценарий без меню (LLM + скрытые DTMF-переходы)
 prompts/llm/             system-промпт и справочники для LLM
 tools/
   make_placeholder_prompts.py  заглушки промптов
   simulate_call.py             симулятор АТС (автономный режим)
   check_external_media.py      проверка доступности ExternalMedia
-tests/                   118 тестов
+tests/                   123 теста
 ```
 
 ## Тесты
@@ -517,7 +546,8 @@ python -m pytest
 AITUNNEL (multipart STT, чанки TTS, ошибки 4xx/5xx).
 LLM: chat/completions с tools, цикл function calling, `get_billing_info`
 и фильтрация технических полей, `end_call`/`transfer_to_operator`, ошибки
-провайдера, загрузка markdown-промптов, сквозной LLM-шаг в AudioSocket.
+провайдера, загрузка markdown-промптов, сквозной LLM-шаг в AudioSocket,
+повтор промпта при тишине, fallback на DTMF без ключа, сценарий `llm-first`.
 
 ## Безопасность
 

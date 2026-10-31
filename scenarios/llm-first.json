@@ -1,0 +1,65 @@
+{
+  "name": "llm-first",
+  "description": "LLM-first: свободный диалог без озвученного меню, скрытые DTMF-переходы",
+  "initial": "greeting",
+  "steps": {
+    "greeting": {
+      "label": "приветствие",
+      "prompt": "greeting.wav",
+      "next": "dialog"
+    },
+    "dialog": {
+      "label": "свободный диалог",
+      "prompt": "dialog.wav",
+      "text": "Чем я могу помочь?",
+      "llm": true,
+      "timeout_ms": 8000,
+      "max_attempts": 2,
+      "dtmf": {
+        "1": "balance",
+        "2": "tech_support",
+        "3": "payment",
+        "0": "operator"
+      },
+      "voice": {
+        "оператор": "operator",
+        "соедините с оператором": "operator"
+      },
+      "on_invalid": "no_input",
+      "on_timeout": "no_input"
+    },
+    "no_input": {
+      "label": "нет ввода",
+      "prompt": "no_input.wav",
+      "next": "fallback"
+    },
+    "balance": {
+      "label": "баланс из биллинга",
+      "prompt": "balance.wav",
+      "prompt_not_found": "balance_not_found.wav",
+      "prompt_error": "balance_error.wav",
+      "billing": "caller",
+      "next": "dialog"
+    },
+    "tech_support": {
+      "label": "техподдержка (заглушка)",
+      "prompt": "tech_support.wav",
+      "next": "dialog"
+    },
+    "payment": {
+      "label": "оплата (заглушка)",
+      "prompt": "payment.wav",
+      "next": "dialog"
+    },
+    "operator": {
+      "label": "соединение с оператором",
+      "prompt": "operator.wav",
+      "hangup": true
+    },
+    "fallback": {
+      "label": "перевод на оператора после нескольких неудач",
+      "prompt": "fallback.wav",
+      "hangup": true
+    }
+  }
+}

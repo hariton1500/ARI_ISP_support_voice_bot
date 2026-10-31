@@ -21,6 +21,7 @@ def test_default_scenario_is_valid() -> None:
     assert scenario.name == "default"
     assert scenario.initial == "greeting"
     assert scenario.steps["menu"].dtmf["0"] == "operator"
+    assert scenario.steps["menu"].llm is True
     assert scenario.steps["operator"].hangup is True
     assert "menu.wav" in scenario.prompt_names
     assert len(scenario.prompt_names) == len(set(scenario.prompt_names))
@@ -62,6 +63,7 @@ def test_step_defaults() -> None:
     step = scenario.steps["step"]
     assert step.timeout_ms == 8000
     assert step.max_attempts == 2
+    assert step.llm is False
     assert step.next is None
     assert step.hangup is False
 
@@ -124,6 +126,16 @@ def test_steps_mapping_is_read_only() -> None:
     scenario = Scenario.load(DEFAULT_SCENARIO)
     with pytest.raises(TypeError):
         scenario.steps["new"] = scenario.steps["menu"]  # type: ignore[index]
+
+
+def test_llm_step_is_parsed() -> None:
+    scenario = Scenario.from_dict(
+        _raw(
+            menu={"prompt": "menu.wav", "llm": True, "dtmf": {"0": "operator"}},
+            operator={"prompt": "operator.wav", "hangup": True},
+        )
+    )
+    assert scenario.steps["menu"].llm is True
 
 
 def test_voice_commands_and_text_are_parsed() -> None:

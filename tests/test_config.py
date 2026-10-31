@@ -116,6 +116,43 @@ def test_speech_settings(monkeypatch) -> None:
     assert settings.masked()["ai_tunnel_api_key"] == "***"
 
 
+def test_llm_settings(monkeypatch) -> None:
+    for name in (
+        "AITUNNEL_API_KEY",
+        "LLM_MODEL",
+        "LLM_PROMPTS_DIR",
+        "LLM_TEMPERATURE",
+        "LLM_MAX_TOKENS",
+        "LLM_TIMEOUT",
+        "LLM_MAX_TOOL_ROUNDS",
+        "LLM_HISTORY_MESSAGES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings.from_env()
+    assert settings.llm_model == "gpt-4o-mini"
+    assert settings.llm_prompts_dir == PROJECT_ROOT / "prompts" / "llm"
+    assert settings.llm_temperature == 0.3
+    assert settings.llm_max_tokens == 300
+    assert settings.llm_max_tool_rounds == 4
+    assert settings.llm_enabled is False
+
+    monkeypatch.setenv("AITUNNEL_API_KEY", "sk-aitunnel-secret")
+    monkeypatch.setenv("LLM_MODEL", "gpt-4.1-mini")
+    monkeypatch.setenv("LLM_PROMPTS_DIR", "prompts/custom-llm")
+    monkeypatch.setenv("LLM_TEMPERATURE", "0,5")
+    monkeypatch.setenv("LLM_MAX_TOKENS", "450")
+    monkeypatch.setenv("LLM_MAX_TOOL_ROUNDS", "2")
+    monkeypatch.setenv("LLM_HISTORY_MESSAGES", "12")
+    settings = Settings.from_env()
+    assert settings.llm_enabled is True
+    assert settings.llm_model == "gpt-4.1-mini"
+    assert settings.llm_prompts_dir == PROJECT_ROOT / "prompts" / "custom-llm"
+    assert settings.llm_temperature == pytest.approx(0.5)
+    assert settings.llm_max_tokens == 450
+    assert settings.llm_max_tool_rounds == 2
+    assert settings.llm_history_messages == 12
+
+
 def test_bad_port_raises(monkeypatch) -> None:
     monkeypatch.setenv("AUDIOSOCKET_PORT", "abc")
     with pytest.raises(ValueError, match="AUDIOSOCKET_PORT"):

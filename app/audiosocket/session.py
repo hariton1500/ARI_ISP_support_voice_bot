@@ -43,9 +43,15 @@ from app.config import Settings
 from app.dialog.intents import match_voice
 from app.dialog.prompts import PromptMap
 from app.dialog.scenario import Scenario, Step
+from app.llm.conversation import LLMBackend
+from app.llm.errors import LLMError
+from app.llm.tools import VoiceTools
 from app.speech.client import SpeechBackend, SpeechError
 from app.speech.streaming import StreamingVoiceInput
 from app.speech.vad import VadConfig, VadEventKind
+
+#: Что сказать, если LLM/AITUNNEL недоступны: без технических подробностей.
+LLM_ERROR_TEXT = "Извините, произошла техническая ошибка. Перевожу вас на оператора."
 
 
 class InputBuffer:
@@ -105,6 +111,11 @@ class CallStats:
     barge_ins: int = 0
     tts_characters: int = 0
     speech_errors: int = 0
+    #: LLM: число реплик, вызовов инструментов, ошибок и озвученных ответов.
+    llm_turns: int = 0
+    llm_tool_calls: int = 0
+    llm_errors: int = 0
+    llm_replies: list[str] = field(default_factory=list)
     #: Последний ответ биллинга (для sidecar-JSON): outcome, userId и данные абонента.
     billing: dict[str, object] | None = None
 
@@ -124,6 +135,7 @@ class CallSession:
         pending: PendingCall | None = None,
         billing: BillingLookup | None = None,
         speech: SpeechBackend | None = None,
+        llm: LLMBackend | None = None,
         logger: logging.Logger | None = None,
         peer: str | None = None,
     ) -> None:
@@ -138,6 +150,7 @@ class CallSession:
         self._pending = pending
         self._billing = billing
         self._speech = speech
+        self._llm = llm
         self._channel_id: str | None = None
 
         self.session_id: str | None = None
@@ -445,6 +458,8 @@ class CallSession:
     async def _run_step(self, step: Step) -> str | None:
         """Проиграть шаг и вернуть имя следующего шага (None — конец диалога)."""
         prompt = await self._resolve_prompt(step)
+        if step.llm:
+            return await self._run_llm_step(step, prompt)
         attempts = 0
         while True:
             if self._closed:
@@ -513,6 +528,127 @@ class CallSession:
                 attempts,
                 step.max_attempts,
             )
+
+    async def _run_llm_step(self, step: Step, prompt: str | None) -> str | None:
+        """Промпт шага, затем свободный диалог с LLM и инструментами.
+
+        DTMF и `voice`-команды сценария остаются быстрыми переходами. Всё
+        остальное уходит модели; её ответ озвучивается через TTS, а barge-in
+        работает так же, как для обычного промпта.
+        """
+        await self._play_prompt(step, prompt)
+        if self._closed:
+            raise ConnectionAbortedError("вызов завершён")
+        if step.hangup:
+            return None
+        if self._llm is None:
+            self._log.warning(
+                "вызов %s: шаг %s, LLM не настроена (нужен AITUNNEL_API_KEY) — "
+                "работают только DTMF/voice",
+                self.session_id,
+                step.name,
+            )
+            return step.on_invalid or step.on_timeout
+
+        tools = VoiceTools(self._billing, logger=self._log)
+        conversation = self._llm.conversation(tools)
+
+        while not self._closed:
+            digit, text = await self._wait_input(step)
+            if digit is not None:
+                target = step.dtmf.get(digit)
+                if target is not None:
+                    self._log.info(
+                        "вызов %s: шаг %s (LLM), цифра %r -> %s",
+                        self.session_id,
+                        step.name,
+                        digit,
+                        target,
+                    )
+                    return target
+                self._log.info(
+                    "вызов %s: шаг %s (LLM), цифра %r без перехода",
+                    self.session_id,
+                    step.name,
+                    digit,
+                )
+                return step.on_invalid or step.on_timeout
+
+            if text is None:
+                self._log.info(
+                    "вызов %s: шаг %s (LLM), нет ввода за %d мс",
+                    self.session_id,
+                    step.name,
+                    step.timeout_ms,
+                )
+                return step.on_timeout
+
+            target = match_voice(text, step.dtmf, step.voice)
+            if target is not None:
+                self._log.info(
+                    "вызов %s: шаг %s (LLM), фраза %r -> %s",
+                    self.session_id,
+                    step.name,
+                    text,
+                    target,
+                )
+                return target
+
+            self._log.info("вызов %s: LLM запрос: %r", self.session_id, text)
+            before = getattr(conversation, "tool_calls", 0)
+            try:
+                reply = await conversation.ask(text)
+            except asyncio.CancelledError:
+                raise
+            except LLMError as exc:
+                self._stats.llm_errors += 1
+                self._log.error("вызов %s: LLM: %s", self.session_id, exc)
+                return await self._llm_failure(step)
+            except Exception:  # noqa: BLE001 - LLM не должна ронять вызов
+                self._stats.llm_errors += 1
+                self._log.exception("вызов %s: неожиданная ошибка LLM", self.session_id)
+                return await self._llm_failure(step)
+
+            self._stats.llm_turns += 1
+            self._stats.llm_tool_calls += max(
+                0, getattr(conversation, "tool_calls", 0) - before
+            )
+            self._stats.llm_replies.append(reply.text)
+            del self._stats.llm_replies[:-20]
+            self._log.info(
+                "вызов %s: LLM ответ: %r (инструментов: %d)",
+                self.session_id,
+                reply.text,
+                getattr(conversation, "tool_calls", 0),
+            )
+            await self._speak_text(reply.text, f"{step.name}:llm")
+
+            if reply.end_call:
+                self._stats.hangup_reason = "llm_end_call"
+                self._log.info("вызов %s: LLM завершила разговор", self.session_id)
+                return None
+            if reply.transfer:
+                self._stats.hangup_reason = "llm_transfer"
+                self._log.info("вызов %s: LLM переводит на оператора", self.session_id)
+                return self._operator_step()
+
+        raise ConnectionAbortedError("вызов завершён")
+
+    async def _llm_failure(self, step: Step) -> str | None:
+        """Извиниться и уйти на оператора (или fallback шага)."""
+        target = self._operator_step()
+        if target is not None:
+            await self._speak_text(LLM_ERROR_TEXT, f"{step.name}:llm-error")
+            return target
+        await self._speak_text(
+            "Извините, произошла техническая ошибка. Попробуйте ещё раз.",
+            f"{step.name}:llm-error",
+        )
+        return step.on_invalid or step.on_timeout
+
+    def _operator_step(self) -> str | None:
+        """Шаг перевода на оператора, если он есть в сценарии."""
+        return "operator" if "operator" in self._scenario.steps else None
 
     async def _play_prompt(self, step: Step, prompt: str | None = None) -> None:
         if self._closed:
@@ -725,6 +861,10 @@ class CallSession:
             "barge_ins": self._stats.barge_ins,
             "tts_characters": self._stats.tts_characters,
             "speech_errors": self._stats.speech_errors,
+            "llm_turns": self._stats.llm_turns,
+            "llm_tool_calls": self._stats.llm_tool_calls,
+            "llm_errors": self._stats.llm_errors,
+            "llm_replies": list(self._stats.llm_replies),
             "hangup_reason": self._stats.hangup_reason,
             "billing": self._stats.billing,
             "recording": self._recording_path.name,

@@ -23,6 +23,7 @@ from app.audiosocket.session import CallSession
 from app.config import Settings
 from app.dialog.prompts import PromptMap
 from app.dialog.scenario import Scenario
+from app.llm.conversation import LLMBackend
 from app.speech.client import SpeechBackend
 
 
@@ -38,6 +39,7 @@ class AudioSocketServer:
         registry: PendingRegistry | None = None,
         billing: BillingLookup | None = None,
         speech: SpeechBackend | None = None,
+        llm: LLMBackend | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._settings = settings
@@ -46,6 +48,7 @@ class AudioSocketServer:
         self._registry = registry
         self._billing = billing
         self._speech = speech
+        self._llm = llm
         self._log = logger or logging.getLogger("app.audiosocket.server")
         self._server: asyncio.AbstractServer | None = None
         self._sessions: set[CallSession] = set()
@@ -135,6 +138,7 @@ class AudioSocketServer:
                 pending=pending,
                 billing=self._billing,
                 speech=self._speech,
+                llm=self._llm,
                 logger=self._log,
                 peer=peer_name,
             )

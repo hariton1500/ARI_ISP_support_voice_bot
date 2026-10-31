@@ -153,6 +153,15 @@ class Settings:
     #: 0 — не запрашивать промежуточные гипотезы STT.
     stt_partial_interval_ms: int = 1200
 
+    # LLM: AITUNNEL /chat/completions + инструменты (см. app/llm/).
+    llm_model: str = "gpt-4o-mini"
+    llm_prompts_dir: Path = PROJECT_ROOT / "prompts" / "llm"
+    llm_temperature: float = 0.3
+    llm_max_tokens: int = 300
+    llm_timeout: float = 30.0
+    llm_max_tool_rounds: int = 4
+    llm_history_messages: int = 40
+
     @classmethod
     def from_env(cls) -> Settings:
         return cls(
@@ -198,6 +207,13 @@ class Settings:
             vad_rms_threshold=_get_float("VAD_RMS_THRESHOLD", 300.0),
             vad_noise_multiplier=_get_float("VAD_NOISE_MULTIPLIER", 2.5),
             stt_partial_interval_ms=_get_int("STT_PARTIAL_INTERVAL_MS", 1200),
+            llm_model=_get_str("LLM_MODEL", "gpt-4o-mini"),
+            llm_prompts_dir=_get_path("LLM_PROMPTS_DIR", "prompts/llm"),
+            llm_temperature=_get_float("LLM_TEMPERATURE", 0.3),
+            llm_max_tokens=_get_int("LLM_MAX_TOKENS", 300),
+            llm_timeout=_get_float("LLM_TIMEOUT", 30.0),
+            llm_max_tool_rounds=_get_int("LLM_MAX_TOOL_ROUNDS", 4),
+            llm_history_messages=_get_int("LLM_HISTORY_MESSAGES", 40),
         )
 
     def with_overrides(self, **overrides: object) -> Settings:
@@ -221,6 +237,11 @@ class Settings:
     @property
     def speech_enabled(self) -> bool:
         """AITUNNEL готов: есть ключ и не отключён голосовой ввод/синтез."""
+        return bool(self.ai_tunnel_api_key)
+
+    @property
+    def llm_enabled(self) -> bool:
+        """LLM доступна вместе с речью: AITUNNEL_API_KEY задан."""
         return bool(self.ai_tunnel_api_key)
 
     @property

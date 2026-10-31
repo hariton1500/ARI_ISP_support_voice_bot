@@ -61,16 +61,21 @@
 * проигрывание WAV-промптов с реальным темпом (20 мс) и перебивание нажатием;
 * **STT/TTS на русском через AITUNNEL**: распознавание реплик, синтез `text`-
   шагов в PCM-поток, VAD и эндпоинтинг по тишине, barge-in по голосу;
+* **LLM и инструменты через AITUNNEL** (`/chat/completions`): свободный диалог
+  на шагах `"llm": true`, function calling `get_billing_info`,
+  `transfer_to_operator`, `end_call`; ответ модели озвучивается через TTS;
+* промпты LLM — markdown в `prompts/llm/`: роль и правила, данные биллинга,
+  условия подключения, тарифы для частных лиц;
 * запись входящего звука в WAV + JSON-метаданные вызова (включая расшифровки,
-  число barge-in и объём TTS);
+  число barge-in, объём TTS и LLM-реплики);
 * запрос в биллинг по `userId` (баланс, тариф, дни, состояние сети) на шаге
   `balance`; результат уходит в лог и в метаданные вызова;
-* 107 тестов, включая сквозной прогон «StasisStart → ExternalMedia → TCP по UUID
-  → DTMF/голос → очистка» на фейковом ARI, контракт биллинга и fake-сервер
-  AITUNNEL (STT multipart, TTS-поток, ресемплинг).
+* 118 тестов, включая сквозной прогон «StasisStart → ExternalMedia → TCP по UUID
+  → DTMF/голос → очистка» на фейковом ARI, контракт биллинга, fake-сервер
+  AITUNNEL (STT multipart, TTS-поток, ресемплинг) и LLM function calling.
 
-LLM и инструменты (баланс, заявка на выезд), RAG — следующий этап (точки
-расширения: `app/dialog`, `app/speech`).
+RAG с поиском по фрагментам и PostgreSQL для логов — следующие этапы (точки
+расширения: `app/llm`, `app/dialog`).
 
 ## Быстрый старт
 
@@ -85,7 +90,8 @@ python -m app --ari-check       # REST + WebSocket ARI
 python -m app --billing-check 1 # абонент из биллинга (userId=1)
 python -m app --tts-check "Проверка синтеза речи"   # AITUNNEL TTS -> WAV
 python -m app --stt-check recordings/<id>.wav      # AITUNNEL STT -> текст
-python -m app --check           # сценарий и промпты
+python -m app --llm-check "Какие тарифы в Евпатории?" # LLM + инструменты
+python -m app --check           # сценарий, промпты, LLM-промпты
 python -m app                   # бот: ARI + AudioSocket + речь
 ```
 
@@ -101,7 +107,8 @@ INFO [app.ari.manager] ARI: приложение 'ivr_ai', события ws://�
 Полезные флаги: `--no-ari` (автономный режим без Asterisk), `--port`,
 `--external-media-host`, `--allow-unknown-sessions`, `--log-level DEBUG`,
 `--billing-check USER_ID`, `--billing-mock`, `--tts-check TEXT`,
-`--stt-check AUDIO`, `--tts-output PATH`.
+`--stt-check AUDIO`, `--llm-check TEXT`, `--tts-output PATH`,
+`--llm-prompts-dir PATH`.
 
 ## Сетевое требование (обязательно)
 
@@ -186,6 +193,13 @@ Asterisk наш IP уже в белом списке.
 | `VAD_RMS_THRESHOLD` | `300` | минимальный RMS кадра PCM16 |
 | `VAD_NOISE_MULTIPLIER` | `2.5` | запас порога над шумовой дорожкой |
 | `STT_PARTIAL_INTERVAL_MS` | `1200` | период промежуточных гипотез; `0` — только финал |
+| `LLM_MODEL` | `gpt-4o-mini` | модель `/chat/completions` AITUNNEL |
+| `LLM_PROMPTS_DIR` | `prompts/llm` | каталог markdown-промптов LLM |
+| `LLM_TEMPERATURE` | `0.3` | температура генерации |
+| `LLM_MAX_TOKENS` | `300` | лимит ответа (короткие фразы для голоса) |
+| `LLM_TIMEOUT` | `30` | таймаут запроса к LLM, с |
+| `LLM_MAX_TOOL_ROUNDS` | `4` | раундов function calling на реплику |
+| `LLM_HISTORY_MESSAGES` | `40` | сообщений истории в разговоре |
 | `LOG_LEVEL` | `INFO` | уровень логирования |
 
 Пароль ARI, токен биллинга и ключ AITUNNEL маскируются в логах
@@ -204,6 +218,7 @@ Asterisk наш IP уже в белом списке.
     "menu": {
       "label": "главное меню",
       "prompt": "menu.wav",
+      "llm": true,
       "timeout_ms": 8000,
       "max_attempts": 2,
       "dtmf": {"1": "balance", "2": "tech_support", "3": "payment", "0": "operator"},
@@ -224,6 +239,7 @@ Asterisk наш IP уже в белом списке.
 | `next` | переход после промпта (если не ждём ввод) |
 | `dtmf` | карта «цифра → шаг» |
 | `voice` | карта «фраза → шаг» для распознанной речи |
+| `llm` | `true` — свободный диалог через LLM; DTMF/`voice` остаются быстрыми переходами |
 | `timeout_ms` | ожидание ввода (по умолчанию 8000) |
 | `max_attempts` | попытки при неверном вводе (по умолчанию 2) |
 | `on_invalid` | шаг после исчерпания попыток при неверной цифре/фразе |
@@ -239,6 +255,12 @@ Asterisk наш IP уже в белом списке.
 работают числительные («один», «раз», «два», … «ноль») — они сопоставляются
 с картой `dtmf`. Сценарий валидируется при старте: неизвестные ссылки, кривые
 цифры и отрицательные таймауты дают ошибку и код возврата 2.
+
+Если у шага `"llm": true`, после промпта включается свободный диалог: сначала
+проверяются `dtmf` и `voice`, а незнакомая фраза уходит LLM. Модель может
+вызвать инструмент и продолжить разговор; `end_call` завершает вызов,
+`transfer_to_operator` уводит на шаг `operator` (если он есть). Без
+`AITUNNEL_API_KEY` шаг работает как обычный: только DTMF/`voice`.
 
 ## Речь: STT/TTS, VAD и barge-in (AITUNNEL)
 
@@ -281,6 +303,53 @@ python -m app --stt-check recordings/tts.wav
 barge-in может срабатывать ложно. В таком случае поднимите
 `VAD_RMS_THRESHOLD`/`VAD_START_MS` или отключите `VOICE_BARGE_IN`.
 
+## LLM и инструменты (AITUNNEL)
+
+Свободный диалог включается у шага с `"llm": true` (в `scenarios/default.json`
+это `menu`). Сначала работают быстрые DTMF/`voice`-переходы, затем незнакомая
+фраза уходит в `POST /chat/completions` AITUNNEL. Ответ модели очищается от
+markdown и озвучивается потоковым TTS; barge-in работает как для промпта.
+
+Промпты лежат в `prompts/llm/` и передаются модели как system-сообщение:
+
+| Файл | Назначение |
+|---|---|
+| `support_evp.md` | роль, правила общения, сценарии, перевод на оператора |
+| `billing_account_data.md` | как объяснять данные биллинга, без JSON и технических полей |
+| `connection_terms.md` | обязательная оплата первых 12 месяцев при подключении |
+| `internet_private.md` | тарифы по населённым пунктам и условиям |
+
+Инструменты (function calling):
+
+| Инструмент | Что делает |
+|---|---|
+| `get_billing_info(user_id)` | `BillingClient.fetch_subscriber`; модели уходят только баланс, тариф, абонплата, дни, состояние сети, ремонт и `auto_activation_enabled`. `packet_id`, `access_hwid`, `snmp_*` отфильтрованы |
+| `transfer_to_operator()` | помечает перевод; сессия переходит на шаг `operator`, если он есть |
+| `end_call()` | завершает звонок после озвучки прощания |
+
+Особенности:
+
+* номер лицевого счёта проверяется: только цифры, до 24 знаков;
+* при ошибке биллинга модели возвращается `billing_unavailable`, она должна
+  извиниться и предложить оператора; технические детали в речь не попадают;
+* LLM не стримит текст: сначала приходит полный ответ, затем TTS. Это упрощает
+  function calling; потоковым остаётся только аудио;
+* история ограничена `LLM_HISTORY_MESSAGES`, раунды инструментов —
+  `LLM_MAX_TOOL_ROUNDS`;
+* при недоступности LLM бот говорит «Извините, произошла техническая ошибка.
+  Перевожу вас на оператора» и уходит на шаг `operator`;
+* без `AITUNNEL_API_KEY` остаются DTMF и `voice`-команды, LLM-шаг не ломает
+  вызов;
+* в `<uuid>.json` пишутся `llm_turns`, `llm_tool_calls`, `llm_errors`,
+  `llm_replies`.
+
+Проверка без звонка:
+
+```powershell
+python -m app --llm-check "Какие тарифы в Евпатории?"
+python -m app --check
+```
+
 ## Биллинг
 
 Шаг с полем `billing` сначала спрашивает биллинг, потом играет промпт:
@@ -313,10 +382,10 @@ python -m app --billing-check 503   # тестовый номер: "не най�
 python -m app --billing-check 1 --billing-mock   # тестовые данные без сети
 ```
 
-Сумма пока не проговаривается голосом: в проекте только тоновые заглушки
-промптов, поэтому шаг сообщает об успехе/неудаче запроса. Чтобы озвучить
-баланс, добавьте в шаг `text` (или запишите промпт диктором) — текст уйдёт в
-AITUNNEL TTS. Шаблоны с подстановкой суммы появятся вместе с LLM-этапом.
+Сумма не подставляется в WAV-промпт: шаг `balance` сообщает только
+успех/неудачу запроса, а детали абонент слышит в LLM-диалоге через инструмент
+`get_billing_info`. Для сценарного шага можно добавить `text` (или записать
+промпт диктором) — текст уйдёт в AITUNNEL TTS.
 
 ## Промпты
 
@@ -339,7 +408,7 @@ AITUNNEL TTS. Шаблоны с подстановкой суммы появят
   значение `data` из ExternalMedia;
 * `<uuid>.json` — сценарий, канал ARI, номер абонента, время, длительность,
   число аудиофреймов, DTMF, шаги, распознанные реплики, число barge-in,
-  объём TTS, причина завершения и ответ биллинга
+  объём TTS, LLM-реплики/инструменты, причина завершения и ответ биллинга
   (`billing`: `outcome`, `user_id`, баланс, тариф, дни, состояние сети).
 
 ```json
@@ -356,6 +425,10 @@ AITUNNEL TTS. Шаблоны с подстановкой суммы появят
   "barge_ins": 2,
   "tts_characters": 0,
   "speech_errors": 0,
+  "llm_turns": 1,
+  "llm_tool_calls": 1,
+  "llm_errors": 0,
+  "llm_replies": ["На вашем счёте четыреста двадцать девять рублей..."],
   "hangup_reason": "hangup_step",
   "billing": {
     "outcome": "found",
@@ -376,7 +449,7 @@ AITUNNEL TTS. Шаблоны с подстановкой суммы появят
 ## Проверка без АТС
 
 ```powershell
-python -m pytest                 # 107 тестов: ARI, TCP, биллинг, речь/VAD
+python -m pytest                 # 118 тестов: ARI, TCP, биллинг, речь/VAD, LLM
 ```
 
 Автономный режим (без Asterisk, для отладки сценария):
@@ -392,7 +465,7 @@ python tools/simulate_call.py --digits 0 --save recordings/prompts.wav
 
 ```
 app/
-  __main__.py            запуск, --ari-check, --billing-check, --tts-check, --stt-check
+  __main__.py            запуск, --ari-check, --billing-check, --tts-check, --stt-check, --llm-check
   config.py              настройки из .env
   logging_setup.py       логи + маскирование секретов
   network.py             локальные IPv4 для подсказок
@@ -404,9 +477,14 @@ app/
     protocol.py          фреймы AudioSocket, чтение UUID
     registry.py          связка «UUID ↔ вызов ARI»
     server.py            TCP-сервер, по сессии на соединение
-    session.py           диалог, промпты, VAD/STT, barge-in, запись, биллинг
+    session.py           диалог, промпты, VAD/STT, barge-in, LLM, запись, биллинг
   billing/
     client.py            POST {"userId": ...} + Bearer, разбор ответа
+  llm/
+    client.py            AITUNNEL /chat/completions, tool calls
+    conversation.py      история, function calling, очистка текста для TTS
+    tools.py             get_billing_info, transfer_to_operator, end_call
+    prompts.py           загрузка system-промпта и справочников
   speech/
     client.py            AITUNNEL STT/TTS, поток PCM и ресемплинг
     vad.py               RMS-VAD и эндпоинтинг
@@ -415,11 +493,12 @@ app/
   dialog/                сценарий, промпты, голосовые интенты
 asterisk/README.md       что настроено на стороне Asterisk
 scenarios/default.json   сценарий по умолчанию
+prompts/llm/             system-промпт и справочники для LLM
 tools/
   make_placeholder_prompts.py  заглушки промптов
   simulate_call.py             симулятор АТС (автономный режим)
   check_external_media.py      проверка доступности ExternalMedia
-tests/                   107 тестов
+tests/                   118 тестов
 ```
 
 ## Тесты
@@ -436,6 +515,9 @@ python -m pytest
 Речь: VAD/эндпоинтинг, пре-ролл и промежуточные гипотезы, сопоставление фраз
 и числительных, barge-in по голосу, TTS-поток в AudioSocket, fake-сервер
 AITUNNEL (multipart STT, чанки TTS, ошибки 4xx/5xx).
+LLM: chat/completions с tools, цикл function calling, `get_billing_info`
+и фильтрация технических полей, `end_call`/`transfer_to_operator`, ошибки
+провайдера, загрузка markdown-промптов, сквозной LLM-шаг в AudioSocket.
 
 ## Безопасность
 
@@ -452,9 +534,13 @@ AITUNNEL (multipart STT, чанки TTS, ошибки 4xx/5xx).
 * Для чувствительных данных у AITUNNEL можно запросить провайдеров с нулевым
   хранением (ZDR), но записи всё равно уходят во внешний API — это надо
   отразить в политике обработки ПДн.
+* LLM получает только разрешённые поля биллинга (`packet_id`, `access_hwid`,
+  `snmp_*` отфильтрованы). Промпты и ответы модели — недоверенный ввод:
+  не выполняйте по ним команды ОС, не добавляйте инструменты, меняющие биллинг
+  или настройки, без отдельного подтверждения.
 
 ## Дальнейшие этапы
 
-1. LLM + инструменты (баланс, статус услуги, заявка на выезд), RAG по регламентам.
+1. RAG: поиск по фрагментам регламентов вместо передачи всех справочников в system.
 2. PostgreSQL для логов диалогов, метрики задержек, docker-compose с тестовой АТС.
 3. Перевод на TLS-эндпоинт ARI, когда провайдер его включит.

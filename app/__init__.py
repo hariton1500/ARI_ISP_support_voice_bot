@@ -1,7 +1,7 @@
-"""Голосовой бот службы поддержки: AudioSocket + ARI + речь AITUNNEL.
+"""Голосовой бот службы поддержки: AudioSocket + ARI + речь и LLM AITUNNEL.
 
-Сетевой слой построен на asyncio; для REST/WebSocket ARI, биллинга и
-STT/TTS используется aiohttp, для PCM — numpy.
+Сетевой слой построен на asyncio; для REST/WebSocket ARI, биллинга,
+STT/TTS и chat/completions используется aiohttp, для PCM — numpy.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

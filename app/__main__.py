@@ -6,6 +6,7 @@
     python -m app --billing-check 1  # запросить абонента в биллинге и выйти
     python -m app --tts-check "текст"  # синтез AITUNNEL в WAV
     python -m app --stt-check rec.wav  # распознать файл через AITUNNEL
+    python -m app --llm-check "..."    # LLM + инструменты AITUNNEL, без звонка
     python -m app --no-ari         # автономный режим (без Asterisk, для отладки)
     python -m app --port 9093      # переопределить порт AudioSocket
 """
@@ -33,6 +34,9 @@ from app.billing.client import BillingClient, BillingError
 from app.config import Settings, load_settings
 from app.dialog.prompts import load_prompts
 from app.dialog.scenario import Scenario, ScenarioError
+from app.llm.client import LLMClient, LLMError
+from app.llm.prompts import LLMPromptError, LLMPromptSet, load_llm_prompts
+from app.llm.tools import VoiceTools
 from app.logging_setup import setup_logging
 from app.network import local_ipv4_addresses, primary_ipv4, public_ipv4
 from app.speech.client import SpeechClient, SpeechError
@@ -48,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=None, help="порт AudioSocket")
     parser.add_argument("--scenario", type=Path, default=None, help="путь к JSON-сценарию")
     parser.add_argument("--prompts-dir", type=Path, default=None, help="каталог с промптами")
+    parser.add_argument(
+        "--llm-prompts-dir",
+        type=Path,
+        default=None,
+        help="каталог markdown-промптов LLM (по умолчанию prompts/llm)",
+    )
     parser.add_argument("--recordings-dir", type=Path, default=None, help="каталог записей")
     parser.add_argument("--log-level", default=None, help="DEBUG/INFO/WARNING/ERROR")
     parser.add_argument(
@@ -117,6 +127,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="распознать WAV/sln через AITUNNEL и напечатать текст",
     )
+    parser.add_argument(
+        "--llm-check",
+        metavar="TEXT",
+        default=None,
+        help="отправить реплику в LLM AITUNNEL с инструментами и выйти",
+    )
     return parser
 
 
@@ -127,6 +143,7 @@ def _resolve_settings(args: argparse.Namespace) -> Settings:
         audiosocket_port=args.port,
         scenario_path=args.scenario,
         prompts_dir=args.prompts_dir,
+        llm_prompts_dir=args.llm_prompts_dir,
         recordings_dir=args.recordings_dir,
         log_level=args.log_level.upper() if args.log_level else None,
         record_calls=args.record,
@@ -228,6 +245,48 @@ async def _speech_check(
     return 0
 
 
+async def _llm_check(
+    settings: Settings,
+    *,
+    text: str,
+    log: logging.Logger,
+) -> int:
+    """Проверить LLM и инструменты без запуска бота."""
+    if not settings.llm_enabled:
+        log.error("LLM не настроена: задайте AITUNNEL_API_KEY")
+        return 2
+    try:
+        prompts = load_llm_prompts(settings.llm_prompts_dir, log)
+    except LLMPromptError as exc:
+        log.error("%s", exc)
+        return 2
+
+    billing: BillingClient | None = None
+    if settings.billing_enabled:
+        billing = BillingClient(settings, logger=log)
+        await billing.start()
+    try:
+        async with LLMClient(settings, prompts, logger=log) as client:
+            tools = VoiceTools(billing, logger=log)
+            conversation = client.conversation(tools)
+            reply = await conversation.ask(text)
+    except LLMError as exc:
+        log.error("LLM: %s", exc)
+        return 1
+    finally:
+        if billing is not None:
+            await billing.close()
+
+    print(reply.text)
+    log.info(
+        "LLM: инструментов %d, end_call=%s, transfer=%s",
+        getattr(conversation, "tool_calls", 0),
+        reply.end_call,
+        reply.transfer,
+    )
+    return 0
+
+
 async def _ari_check(settings: Settings, log: logging.Logger) -> int:
     """Проверить REST и WebSocket ARI, не поднимая бота."""
     log.info("локальные адреса: %s", ", ".join(local_ipv4_addresses()) or "нет")
@@ -275,6 +334,7 @@ async def _serve(
     prompts: dict[str, bytes],
     *,
     use_ari: bool,
+    llm_prompts: LLMPromptSet | None = None,
 ) -> None:
     log = logging.getLogger("app")
     billing_needed = any(step.billing for step in scenario.steps.values())
@@ -312,6 +372,24 @@ async def _serve(
             "(останется только DTMF)"
         )
 
+    llm_needed = any(step.llm for step in scenario.steps.values())
+    llm: LLMClient | None = None
+    if llm_needed and settings.llm_enabled and llm_prompts is not None:
+        llm = LLMClient(settings, llm_prompts, logger=log)
+        await llm.start()
+        log.info(
+            "LLM AITUNNEL: модель %s, промптов %d (%d символов), "
+            "инструменты: get_billing_info, transfer_to_operator, end_call",
+            settings.llm_model,
+            llm_prompts.document_count,
+            llm_prompts.char_count,
+        )
+    elif llm_needed:
+        log.warning(
+            "в сценарии есть LLM-шаги, но LLM выключена: задайте AITUNNEL_API_KEY "
+            "и проверьте LLM_PROMPTS_DIR (останутся DTMF/voice-команды)"
+        )
+
     registry = PendingRegistry()
     server = AudioSocketServer(
         settings,
@@ -320,6 +398,7 @@ async def _serve(
         registry=registry if use_ari else None,
         billing=billing,
         speech=speech,
+        llm=llm,
     )
     await server.start()
     addresses = ", ".join(local_ipv4_addresses()) or "нет внешних адресов"
@@ -360,6 +439,8 @@ async def _serve(
             await billing.close()
         if speech is not None:
             await speech.close()
+        if llm is not None:
+            await llm.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -408,6 +489,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
 
+    if args.llm_check is not None:
+        return asyncio.run(_llm_check(settings, text=args.llm_check, log=log))
+
     try:
         scenario = Scenario.load(settings.scenario_path)
     except ScenarioError as exc:
@@ -416,22 +500,46 @@ def main(argv: list[str] | None = None) -> int:
 
     prompts = load_prompts(scenario, settings.prompts_dir, log)
 
+    llm_prompts: LLMPromptSet | None = None
+    llm_needed = any(step.llm for step in scenario.steps.values())
+    if llm_needed:
+        try:
+            llm_prompts = load_llm_prompts(settings.llm_prompts_dir, log)
+        except LLMPromptError as exc:
+            if settings.llm_enabled:
+                log.error("%s", exc)
+                return 2
+            log.warning("%s (LLM выключена, работают DTMF/voice)", exc)
+
     if args.check:
         missing = [name for name in scenario.prompt_names if name not in prompts]
         log.info(
-            "проверка пройдена: сценарий %r, шагов %d, промптов %d/%d%s",
+            "проверка пройдена: сценарий %r, шагов %d, промптов %d/%d%s%s",
             scenario.name,
             len(scenario.steps),
             len(prompts),
             len(scenario.prompt_names),
             ", ARI: включён" if use_ari else ", ARI: выключен",
+            (
+                f", LLM-промптов: {llm_prompts.document_count}"
+                if llm_prompts is not None
+                else ", LLM: выключена"
+            ),
         )
         for name in missing:
             log.warning("нет промпта: %s", settings.prompts_dir / name)
         return 0
 
     try:
-        asyncio.run(_serve(settings, scenario, prompts, use_ari=use_ari))
+        asyncio.run(
+            _serve(
+                settings,
+                scenario,
+                prompts,
+                use_ari=use_ari,
+                llm_prompts=llm_prompts,
+            )
+        )
     except KeyboardInterrupt:
         log.info("остановка по Ctrl+C")
     except OSError as exc:

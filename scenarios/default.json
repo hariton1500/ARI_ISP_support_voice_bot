@@ -11,6 +11,7 @@
     "menu": {
       "label": "главное меню",
       "prompt": "menu.wav",
+      "llm": true,
       "timeout_ms": 8000,
       "max_attempts": 2,
       "dtmf": {

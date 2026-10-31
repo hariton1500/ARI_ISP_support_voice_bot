@@ -27,6 +27,7 @@ from app.billing.client import BillingError, Subscriber
 from app.config import Settings
 from app.dialog.prompts import PromptMap, load_prompts
 from app.dialog.scenario import Scenario
+from app.llm.conversation import LLMReply
 from tests.conftest import write_wav
 
 
@@ -327,7 +328,7 @@ def _silence_frame() -> bytes:
     return b"\x00" * 320
 
 
-def _voice_scenario(text_only: bool = False) -> Scenario:
+def _voice_scenario(text_only: bool = False, llm: bool = False) -> Scenario:
     greeting: dict[str, Any] = (
         {"text": "Здравствуйте! Это служба поддержки.", "hangup": True}
         if text_only
@@ -341,6 +342,7 @@ def _voice_scenario(text_only: bool = False) -> Scenario:
                 "greeting": greeting,
                 "menu": {
                     "prompt": "menu.wav",
+                    "llm": llm,
                     "timeout_ms": 3000,
                     "max_attempts": 2,
                     "dtmf": {"0": "operator", "1": "operator"},
@@ -373,8 +375,10 @@ def _voice_settings(tmp_path: Path, prompts_dir: Path) -> Settings:
     )
 
 
-async def _voice_flow(tmp_path: Path, speech: _FakeSpeech) -> dict[str, Any]:
-    scenario = _voice_scenario()
+async def _voice_flow(
+    tmp_path: Path, speech: _FakeSpeech, llm: Any = None
+) -> dict[str, Any]:
+    scenario = _voice_scenario(llm=llm is not None)
     prompts_dir = tmp_path / "voice-prompts"
     write_wav(prompts_dir / "greeting.wav", duration_ms=1000)
     write_wav(prompts_dir / "menu.wav", duration_ms=200)
@@ -383,7 +387,7 @@ async def _voice_flow(tmp_path: Path, speech: _FakeSpeech) -> dict[str, Any]:
     settings = _voice_settings(tmp_path, prompts_dir)
 
     channel_uuid = uuid.uuid4()
-    server = AudioSocketServer(settings, scenario, prompts, speech=speech)
+    server = AudioSocketServer(settings, scenario, prompts, speech=speech, llm=llm)
     await server.start()
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", server.bound_port)
@@ -458,3 +462,51 @@ def test_tts_text_step_streams_audio(tmp_path: Path) -> None:
     assert total == 3200
     assert meta["tts_characters"] == len("Здравствуйте! Это служба поддержки.")
     assert meta["hangup_reason"] == "hangup_step"
+
+
+# --------------------------------------------------------------- LLM-диалог
+
+
+class _FakeLLMConversation:
+    """Заглушка разговора: запоминает реплики и сразу завершает звонок."""
+
+    def __init__(self, backend: _FakeLLM) -> None:
+        self._backend = backend
+        self.tool_calls = 0
+
+    async def ask(self, text: str) -> LLMReply:
+        self._backend.questions.append(text)
+        self._backend.tools.append(self._backend.last_tools)
+        return LLMReply(
+            text="Тарифы уточняются по адресу. Всего доброго!",
+            end_call=True,
+        )
+
+
+class _FakeLLM:
+    def __init__(self) -> None:
+        self.questions: list[str] = []
+        self.last_tools: Any = None
+        self.tools: list[Any] = []
+
+    def conversation(self, tools: Any) -> _FakeLLMConversation:
+        self.last_tools = tools
+        return _FakeLLMConversation(self)
+
+
+def test_llm_step_answers_free_speech_and_ends_call(tmp_path: Path) -> None:
+    text = "Расскажите, какие у вас тарифы"
+    speech = _FakeSpeech(text=text, tts_pcm=b"\x01\x00" * 80)
+    llm = _FakeLLM()
+
+    meta = asyncio.run(_voice_flow(tmp_path, speech, llm=llm))
+
+    assert llm.questions == [text]
+    assert llm.tools and llm.tools[0] is not None
+    assert meta["transcripts"] == [text]
+    assert meta["llm_turns"] == 1
+    assert meta["llm_replies"] == ["Тарифы уточняются по адресу. Всего доброго!"]
+    assert meta["llm_tool_calls"] == 0
+    assert meta["hangup_reason"] == "llm_end_call"
+    assert meta["steps"] == ["greeting", "menu"]
+    assert meta["tts_characters"] == len("Тарифы уточняются по адресу. Всего доброго!")

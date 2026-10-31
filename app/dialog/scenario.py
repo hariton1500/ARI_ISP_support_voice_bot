@@ -5,6 +5,8 @@
   * озвучить `text` через AITUNNEL TTS, если WAV-промпта нет;
   * принять DTMF-цифру и перейти на другой шаг (`dtmf`);
   * принять распознанную фразу (`voice`: фраза -> шаг) или числительное;
+  * вести свободный диалог через LLM (`llm`: true), если фраза не совпала
+    с `voice`/DTMF;
   * перейти на шаг без ожидания ввода (`next`);
   * обработать отсутствие ввода (`on_timeout`) и неверный ввод (`on_invalid`);
   * завершить вызов (`hangup`);
@@ -62,6 +64,9 @@ class Step:
     text: str | None = None
     #: Голосовые команды: нормализованная фраза -> имя шага.
     voice: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    #: Свободный диалог через LLM после промпта. DTMF и `voice` имеют приоритет,
+    #: остальные распознанные фразы уходят модели.
+    llm: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +225,7 @@ def _parse_step(step_name: str, raw: Any) -> Step:
         prompt_error=prompt_error,
         text=_as_optional_str(raw.get("text"), where, "text"),
         voice=MappingProxyType(voice),
+        llm=_as_bool(raw.get("llm"), where, "llm", False),
     )
 
 

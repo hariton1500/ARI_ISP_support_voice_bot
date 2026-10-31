@@ -4,6 +4,8 @@
     python -m app --check          # проверить сценарий и промпты
     python -m app --ari-check      # проверить REST и WebSocket ARI
     python -m app --billing-check 1  # запросить абонента в биллинге и выйти
+    python -m app --tts-check "текст"  # синтез AITUNNEL в WAV
+    python -m app --stt-check rec.wav  # распознать файл через AITUNNEL
     python -m app --no-ari         # автономный режим (без Asterisk, для отладки)
     python -m app --port 9093      # переопределить порт AudioSocket
 """
@@ -23,6 +25,8 @@ from typing import Any
 from app.ari.client import AriClient
 from app.ari.events import AriEventStream
 from app.ari.manager import AriCallManager
+from app.audio.pcm import load_prompt
+from app.audio.recorder import WavRecorder
 from app.audiosocket.registry import PendingRegistry
 from app.audiosocket.server import AudioSocketServer
 from app.billing.client import BillingClient, BillingError
@@ -31,6 +35,7 @@ from app.dialog.prompts import load_prompts
 from app.dialog.scenario import Scenario, ScenarioError
 from app.logging_setup import setup_logging
 from app.network import local_ipv4_addresses, primary_ipv4, public_ipv4
+from app.speech.client import SpeechClient, SpeechError
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -93,6 +98,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="отдавать тестовые данные биллинга без обращения к сети",
     )
+    parser.add_argument(
+        "--tts-check",
+        metavar="TEXT",
+        default=None,
+        help="синтезировать текст через AITUNNEL и сохранить WAV",
+    )
+    parser.add_argument(
+        "--tts-output",
+        type=Path,
+        default=None,
+        help="куда сохранить --tts-check (по умолчанию recordings/tts-check.wav)",
+    )
+    parser.add_argument(
+        "--stt-check",
+        type=Path,
+        metavar="AUDIO",
+        default=None,
+        help="распознать WAV/sln через AITUNNEL и напечатать текст",
+    )
     return parser
 
 
@@ -154,6 +178,53 @@ async def _billing_check(settings: Settings, user_id: str, log: logging.Logger) 
         return 1
     log.info("биллинг: абонент %r — %s", user_id, subscriber.summary)
     print(json.dumps(subscriber.to_dict(), ensure_ascii=False, indent=2))
+    return 0
+
+
+async def _speech_check(
+    settings: Settings,
+    *,
+    tts_text: str | None,
+    stt_path: Path | None,
+    tts_output: Path | None,
+    log: logging.Logger,
+) -> int:
+    """Проверить AITUNNEL: распознать файл и/или озвучить текст."""
+    if not settings.speech_enabled:
+        log.error("речь не настроена: задайте AITUNNEL_API_KEY")
+        return 2
+    try:
+        async with SpeechClient(settings, logger=log) as client:
+            if stt_path is not None:
+                try:
+                    pcm = load_prompt(stt_path)
+                except (OSError, ValueError) as exc:
+                    log.error("не удалось прочитать %s: %s", stt_path, exc)
+                    return 1
+                text = await client.transcribe(pcm)
+                print(text or "<тишина/пустая расшифровка>")
+            if tts_text is not None:
+                chunks = [chunk async for chunk in client.stream_tts(tts_text)]
+                pcm = b"".join(chunks)
+                if not pcm:
+                    log.error("TTS вернул пустой звук")
+                    return 1
+                output = tts_output or settings.recordings_dir / "tts-check.wav"
+                recorder = WavRecorder(output)
+                recorder.open()
+                try:
+                    recorder.write(pcm)
+                finally:
+                    recorder.close()
+                log.info(
+                    "TTS: %d символов -> %s (%.1f с)",
+                    len(tts_text),
+                    output,
+                    recorder.duration_ms / 1000.0,
+                )
+    except SpeechError as exc:
+        log.error("AITUNNEL: %s", exc)
+        return 1
     return 0
 
 
@@ -222,6 +293,25 @@ async def _serve(
             "задайте BILLING_BASE_URL и BILLING_TOKEN (или BILLING_MOCK=1)"
         )
 
+    speech: SpeechClient | None = None
+    if settings.speech_enabled:
+        speech = SpeechClient(settings, logger=log)
+        await speech.start()
+        log.info(
+            "речь AITUNNEL: %s, STT %s, TTS %s/%s, VAD %d мс тишины%s",
+            settings.ai_tunnel_base_url,
+            settings.stt_model,
+            settings.tts_model,
+            settings.tts_voice,
+            settings.vad_silence_ms,
+            ", barge-in вкл" if settings.voice_barge_in else ", barge-in выкл",
+        )
+    else:
+        log.warning(
+            "голосовые функции выключены: задайте AITUNNEL_API_KEY "
+            "(останется только DTMF)"
+        )
+
     registry = PendingRegistry()
     server = AudioSocketServer(
         settings,
@@ -229,6 +319,7 @@ async def _serve(
         prompts,
         registry=registry if use_ari else None,
         billing=billing,
+        speech=speech,
     )
     await server.start()
     addresses = ", ".join(local_ipv4_addresses()) or "нет внешних адресов"
@@ -267,6 +358,8 @@ async def _serve(
         await server.close()
         if billing is not None:
             await billing.close()
+        if speech is not None:
+            await speech.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -277,7 +370,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ошибка настроек: {exc}", file=sys.stderr)
         return 2
 
-    setup_logging(settings.log_level, secrets=(settings.ari_password, settings.billing_token))
+    setup_logging(
+        settings.log_level,
+        secrets=(settings.ari_password, settings.billing_token, settings.ai_tunnel_api_key),
+    )
     log = logging.getLogger("app")
     log.debug("настройки: %s", settings.masked())
 
@@ -300,6 +396,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.billing_check is not None:
         return asyncio.run(_billing_check(settings, args.billing_check, log))
+
+    if args.tts_check is not None or args.stt_check is not None:
+        return asyncio.run(
+            _speech_check(
+                settings,
+                tts_text=args.tts_check,
+                stt_path=args.stt_check,
+                tts_output=args.tts_output,
+                log=log,
+            )
+        )
 
     try:
         scenario = Scenario.load(settings.scenario_path)

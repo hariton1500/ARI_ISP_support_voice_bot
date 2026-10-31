@@ -78,6 +78,44 @@ def test_billing_mock_enables_billing_without_url(monkeypatch) -> None:
     assert settings.billing_enabled is True
 
 
+def test_speech_settings(monkeypatch) -> None:
+    for name in (
+        "AITUNNEL_API_KEY",
+        "AITUNNEL_BASE_URL",
+        "STT_MODEL",
+        "TTS_MODEL",
+        "TTS_VOICE",
+        "VOICE_INPUT",
+        "VOICE_BARGE_IN",
+        "VAD_START_MS",
+        "VAD_SILENCE_MS",
+        "VAD_MIN_SPEECH_MS",
+        "STT_PARTIAL_INTERVAL_MS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings.from_env()
+    assert settings.speech_enabled is False
+    assert settings.ai_tunnel_base_url == "https://api.aitunnel.ru/v1"
+    assert settings.stt_model == "whisper-large-v3-turbo"
+    assert settings.tts_pcm_rate == 24000
+    assert settings.voice_input is True
+    assert settings.voice_barge_in is True
+    assert settings.vad_silence_ms == 700
+
+    monkeypatch.setenv("AITUNNEL_API_KEY", "sk-aitunnel-secret")
+    monkeypatch.setenv("AITUNNEL_BASE_URL", "https://ru-api.aitunnel.ru/v1")
+    monkeypatch.setenv("VOICE_BARGE_IN", "false")
+    monkeypatch.setenv("VAD_SILENCE_MS", "900")
+    monkeypatch.setenv("STT_PARTIAL_INTERVAL_MS", "0")
+    settings = Settings.from_env()
+    assert settings.speech_enabled is True
+    assert settings.ai_tunnel_base_url == "https://ru-api.aitunnel.ru/v1"
+    assert settings.voice_barge_in is False
+    assert settings.vad_silence_ms == 900
+    assert settings.stt_partial_interval_ms == 0
+    assert settings.masked()["ai_tunnel_api_key"] == "***"
+
+
 def test_bad_port_raises(monkeypatch) -> None:
     monkeypatch.setenv("AUDIOSOCKET_PORT", "abc")
     with pytest.raises(ValueError, match="AUDIOSOCKET_PORT"):

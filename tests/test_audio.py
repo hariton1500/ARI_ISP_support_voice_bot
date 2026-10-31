@@ -11,12 +11,14 @@ import numpy as np
 from app.audio.pcm import (
     FRAME_BYTES,
     SAMPLE_RATE,
+    PcmStreamResampler,
     chunk_pcm,
     duration_ms,
     load_prompt,
     read_wav,
     resample,
     silence_ms,
+    to_wav,
 )
 from app.audio.playback import AudioPlayer
 from app.audio.recorder import WavRecorder
@@ -116,3 +118,51 @@ def test_player_stop_interrupts_playback() -> None:
     completed, chunks = asyncio.run(scenario())
     assert completed is False
     assert chunks < 100
+
+
+def test_pcm_stream_resampler_handles_arbitrary_chunks() -> None:
+    source = (np.ones(2400, dtype="<i2") * 7).tobytes()  # 100 мс при 24 кГц
+    resampler = PcmStreamResampler(24000, 8000)
+    output = b""
+    for offset in range(0, len(source), 333):
+        output += b"".join(resampler.feed(source[offset : offset + 333]))
+    output += resampler.flush()
+    assert abs(len(output) - 1600) <= 4
+    samples = np.frombuffer(output, dtype="<i2")
+    assert samples.size > 0
+    assert samples.max() - samples.min() <= 2
+
+
+def test_to_wav_roundtrip() -> None:
+    pcm = (np.ones(800, dtype="<i2") * 100).tobytes()
+    data = to_wav(pcm)
+    assert data.startswith(b"RIFF")
+    assert read_wav_bytes(data) == pcm
+
+
+def read_wav_bytes(data: bytes) -> bytes:
+    import io
+    import wave
+
+    with wave.open(io.BytesIO(data), "rb") as wav:
+        assert wav.getframerate() == SAMPLE_RATE
+        assert wav.getnchannels() == 1
+        return wav.readframes(wav.getnframes())
+
+
+def test_player_plays_async_stream() -> None:
+    received: list[bytes] = []
+
+    async def write(chunk: bytes) -> None:
+        received.append(chunk)
+
+    async def chunks():
+        yield b"\x00" * FRAME_BYTES
+        yield b"\x00" * FRAME_BYTES
+
+    async def scenario() -> bool:
+        player = AudioPlayer(write)
+        return await player.play_stream(chunks())
+
+    assert asyncio.run(scenario()) is True
+    assert received == [b"\x00" * FRAME_BYTES, b"\x00" * FRAME_BYTES]

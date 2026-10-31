@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 
 from app.audio.pcm import FRAME_BYTES, FRAME_MS, chunk_pcm
 
@@ -16,7 +16,7 @@ WriteCallback = Callable[[bytes], Awaitable[None]]
 
 
 class AudioPlayer:
-    """Проигрыватель одного промпта с возможностью досрочной остановки."""
+    """Проигрыватель промпта или потока TTS с досрочной остановкой."""
 
     def __init__(
         self,
@@ -42,6 +42,30 @@ class AudioPlayer:
         if not pcm:
             return True
 
+        async def chunks() -> AsyncIterator[bytes]:
+            for chunk in chunk_pcm(pcm, self._chunk_bytes):
+                yield chunk
+
+        return await self._play_chunks(chunks())
+
+    async def play_stream(self, chunks: AsyncIterator[bytes]) -> bool:
+        """Проиграть поток PCM (TTS), не дожидаясь синтеза целиком."""
+
+        async def frames() -> AsyncIterator[bytes]:
+            try:
+                async for data in chunks:
+                    if not data:
+                        continue
+                    for chunk in chunk_pcm(data, self._chunk_bytes):
+                        yield chunk
+            finally:
+                close = getattr(chunks, "aclose", None)
+                if close is not None:
+                    await close()
+
+        return await self._play_chunks(frames())
+
+    async def _play_chunks(self, chunks: AsyncIterator[bytes]) -> bool:
         loop = asyncio.get_running_loop()
         stop = asyncio.Event()
         self._stop = stop
@@ -49,7 +73,7 @@ class AudioPlayer:
         deadline = loop.time()
         completed = True
         try:
-            for chunk in chunk_pcm(pcm, self._chunk_bytes):
+            async for chunk in chunks:
                 if stop.is_set() or len(chunk) < 2:
                     completed = False
                     break

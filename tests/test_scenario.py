@@ -124,3 +124,36 @@ def test_steps_mapping_is_read_only() -> None:
     scenario = Scenario.load(DEFAULT_SCENARIO)
     with pytest.raises(TypeError):
         scenario.steps["new"] = scenario.steps["menu"]  # type: ignore[index]
+
+
+def test_voice_commands_and_text_are_parsed() -> None:
+    scenario = Scenario.from_dict(
+        _raw(
+            menu={
+                "text": "Скажите «оператор» или нажмите ноль",
+                "dtmf": {"0": "operator"},
+                "voice": {"оператор": "operator", "соедините с оператором": "operator"},
+            },
+            operator={"prompt": "operator.wav", "hangup": True},
+        )
+    )
+    step = scenario.steps["menu"]
+    assert step.text.startswith("Скажите")
+    assert step.voice["оператор"] == "operator"
+    assert "operator.wav" in scenario.prompt_names
+
+
+def test_voice_target_is_validated() -> None:
+    with pytest.raises(ScenarioError, match="voice"):
+        Scenario.from_dict(_raw(a={"voice": {"оператор": "missing"}}))
+
+
+def test_voice_must_be_object() -> None:
+    with pytest.raises(ScenarioError, match="voice"):
+        Scenario.from_dict(_raw(a={"voice": ["оператор"]}))
+
+
+def test_default_scenario_has_voice_commands() -> None:
+    scenario = Scenario.load(DEFAULT_SCENARIO)
+    assert scenario.steps["menu"].voice["оператор"] == "operator"
+    assert scenario.steps["menu"].voice["баланс"] == "balance"

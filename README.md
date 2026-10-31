@@ -56,17 +56,21 @@
 
 * ARI-слой: WS-события с реконнектом, REST-команды, бридж, ExternalMedia,
   привязка TCP к вызову, DTMF из ARI, очистка каналов/бриджа;
-* сценарий диалога в JSON: приветствие, меню, переходы по DTMF, повтор при
-  неверном вводе, таймауты, завершение вызова;
+* сценарий диалога в JSON: приветствие, меню, переходы по DTMF и по голосу,
+  повтор при неверном вводе, таймауты, завершение вызова;
 * проигрывание WAV-промптов с реальным темпом (20 мс) и перебивание нажатием;
-* запись входящего звука в WAV + JSON-метаданные вызова;
+* **STT/TTS на русском через AITUNNEL**: распознавание реплик, синтез `text`-
+  шагов в PCM-поток, VAD и эндпоинтинг по тишине, barge-in по голосу;
+* запись входящего звука в WAV + JSON-метаданные вызова (включая расшифровки,
+  число barge-in и объём TTS);
 * запрос в биллинг по `userId` (баланс, тариф, дни, состояние сети) на шаге
   `balance`; результат уходит в лог и в метаданные вызова;
-* 79 тестов, включая сквозной прогон «StasisStart → ExternalMedia → TCP по UUID
-  → DTMF → очистка» на фейковом ARI и контракт биллинга.
+* 107 тестов, включая сквозной прогон «StasisStart → ExternalMedia → TCP по UUID
+  → DTMF/голос → очистка» на фейковом ARI, контракт биллинга и fake-сервер
+  AITUNNEL (STT multipart, TTS-поток, ресемплинг).
 
-Распознавание речи, синтез и LLM — следующий этап (точки расширения:
-`app/dialog`, `app/audio`).
+LLM и инструменты (баланс, заявка на выезд), RAG — следующий этап (точки
+расширения: `app/dialog`, `app/speech`).
 
 ## Быстрый старт
 
@@ -75,12 +79,14 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 
-copy .env.example .env          # впишите ARI_PASSWORD и EXTERNAL_MEDIA_HOST
+copy .env.example .env          # впишите ARI_PASSWORD, EXTERNAL_MEDIA_HOST, AITUNNEL_API_KEY
 python tools/make_placeholder_prompts.py   # тоновые заглушки промптов
 python -m app --ari-check       # REST + WebSocket ARI
 python -m app --billing-check 1 # абонент из биллинга (userId=1)
+python -m app --tts-check "Проверка синтеза речи"   # AITUNNEL TTS -> WAV
+python -m app --stt-check recordings/<id>.wav      # AITUNNEL STT -> текст
 python -m app --check           # сценарий и промпты
-python -m app                   # бот: ARI + AudioSocket
+python -m app                   # бот: ARI + AudioSocket + речь
 ```
 
 Ожидаемый лог:
@@ -94,7 +100,8 @@ INFO [app.ari.manager] ARI: приложение 'ivr_ai', события ws://�
 
 Полезные флаги: `--no-ari` (автономный режим без Asterisk), `--port`,
 `--external-media-host`, `--allow-unknown-sessions`, `--log-level DEBUG`,
-`--billing-check USER_ID`, `--billing-mock`.
+`--billing-check USER_ID`, `--billing-mock`, `--tts-check TEXT`,
+`--stt-check AUDIO`, `--tts-output PATH`.
 
 ## Сетевое требование (обязательно)
 
@@ -162,9 +169,26 @@ Asterisk наш IP уже в белом списке.
 | `BILLING_TOKEN` | — | Bearer-токен биллинга |
 | `BILLING_TIMEOUT` | `10` | таймаут запроса в биллинг, с |
 | `BILLING_MOCK` | `false` | отдавать тестовые данные биллинга без сети |
+| `AITUNNEL_API_KEY` | — | ключ `sk-aitunnel-…`; без него речь выключена |
+| `AITUNNEL_BASE_URL` | `https://api.aitunnel.ru/v1` | OpenAI-совместимый base URL (зеркало — `https://ru-api.aitunnel.ru/v1`) |
+| `STT_MODEL` | `whisper-large-v3-turbo` | модель `/audio/transcriptions` |
+| `SPEECH_LANGUAGE` | `ru` | подсказка языка для STT |
+| `SPEECH_TIMEOUT` | `20` | таймаут STT/TTS, с |
+| `TTS_MODEL` | `gpt-4o-mini-tts` | модель `/audio/speech` |
+| `TTS_VOICE` | `nova` | голос модели |
+| `TTS_FORMAT` | `pcm` | `pcm` (потоково) или `wav` |
+| `TTS_PCM_RATE` | `24000` | частота PCM от TTS; приводим к 8 кГц |
+| `VOICE_INPUT` | `true` | включить VAD/STT для входящего звука |
+| `VOICE_BARGE_IN` | `true` | останавливать промпт/TTS, когда абонент заговорил |
+| `VAD_START_MS` | `160` | начало речи: столько мс громких кадров подряд |
+| `VAD_SILENCE_MS` | `700` | конец реплики: столько мс тишины |
+| `VAD_MIN_SPEECH_MS` | `200` | реплики короче игнорируются |
+| `VAD_RMS_THRESHOLD` | `300` | минимальный RMS кадра PCM16 |
+| `VAD_NOISE_MULTIPLIER` | `2.5` | запас порога над шумовой дорожкой |
+| `STT_PARTIAL_INTERVAL_MS` | `1200` | период промежуточных гипотез; `0` — только финал |
 | `LOG_LEVEL` | `INFO` | уровень логирования |
 
-Пароль ARI и токен биллинга маскируются в логах
+Пароль ARI, токен биллинга и ключ AITUNNEL маскируются в логах
 (`app.logging_setup.SecretFilter` и `Settings.masked()`).
 
 ## Сценарий диалога
@@ -183,6 +207,8 @@ Asterisk наш IP уже в белом списке.
       "timeout_ms": 8000,
       "max_attempts": 2,
       "dtmf": {"1": "balance", "2": "tech_support", "3": "payment", "0": "operator"},
+      "voice": {"баланс": "balance", "техподдержка": "tech_support",
+                "оператор": "operator"},
       "on_invalid": "invalid_digit",
       "on_timeout": "no_input"
     },
@@ -194,22 +220,66 @@ Asterisk наш IP уже в белом списке.
 | Поле шага | Смысл |
 |---|---|
 | `prompt` | файл промпта относительно `PROMPTS_DIR` |
-| `next` | переход после промпта (если не ждём DTMF) |
+| `text` | текст для TTS, если WAV-промпта нет (AITUNNEL `/audio/speech`) |
+| `next` | переход после промпта (если не ждём ввод) |
 | `dtmf` | карта «цифра → шаг» |
-| `timeout_ms` | ожидание цифры (по умолчанию 8000) |
+| `voice` | карта «фраза → шаг» для распознанной речи |
+| `timeout_ms` | ожидание ввода (по умолчанию 8000) |
 | `max_attempts` | попытки при неверном вводе (по умолчанию 2) |
-| `on_invalid` | шаг после исчерпания попыток при неверной цифре |
+| `on_invalid` | шаг после исчерпания попыток при неверной цифре/фразе |
 | `on_timeout` | шаг при отсутствии ввода |
 | `hangup` | завершить вызов после промпта |
 | `billing` | перед промптом запросить биллинг: `"caller"` (номер звонящего) или конкретный `userId` |
 | `prompt_not_found` | промпт, если абонент не найден (по умолчанию — `prompt`) |
 | `prompt_error` | промпт, если биллинг недоступен (по умолчанию — `prompt`) |
 
-Верная цифра → переход по `dtmf`; неверная цифра или тишина → повтор шага;
-после `max_attempts` → `on_invalid`/`on_timeout` (если перехода нет —
-`on_timeout`, если нет и его — конец диалога). Сценарий валидируется при
-старте: неизвестные ссылки, кривые цифры и отрицательные таймауты дают ошибку
-и код возврата 2.
+Верный ввод → переход по `dtmf`/`voice`; неверный ввод или тишина → повтор
+шага; после `max_attempts` → `on_invalid`/`on_timeout` (если перехода нет —
+`on_timeout`, если нет и его — конец диалога). Кроме фраз из `voice`,
+работают числительные («один», «раз», «два», … «ноль») — они сопоставляются
+с картой `dtmf`. Сценарий валидируется при старте: неизвестные ссылки, кривые
+цифры и отрицательные таймауты дают ошибку и код возврата 2.
+
+## Речь: STT/TTS, VAD и barge-in (AITUNNEL)
+
+Используется OpenAI-совместимый шлюз **AITUNNEL** (`https://api.aitunnel.ru/v1`):
+
+* **STT** — `POST /audio/transcriptions`, multipart c WAV, `language=ru`;
+  по умолчанию `whisper-large-v3-turbo` (есть и `gpt-4o-transcribe`);
+* **TTS** — `POST /audio/speech`, `response_format=pcm`, голос `nova`
+  (`gpt-4o-mini-tts`); ответ читается кусками и сразу уходит в AudioSocket,
+  ресемплер приводит 24 кГц к 8 кГц.
+
+У AITUNNEL нет WebSocket/SSE для STT, поэтому потоковость сделана на стороне
+бота (`app/speech`):
+
+```
+PCM 8 кГц ──► VAD (RMS, адаптивный порог)
+                │ начало речи ──► barge-in: stop() промпта/TTS
+                │ каждые STT_PARTIAL_INTERVAL_MS ──► STT (промежуточная гипотеза)
+                └ VAD_SILENCE_MS тишины ──► финальный STT ──► match_voice()
+```
+
+* **Эндпоинтинг**: речь начинается после `VAD_START_MS` громких кадров, реплика
+  завершается после `VAD_SILENCE_MS` тишины; слишком короткие отбрасываются.
+* **Barge-in по голосу**: при начале речи во время промпта или TTS
+  воспроизведение останавливается (`VOICE_BARGE_IN=true`), а распознанная
+  реплика сразу участвует в переходе по `voice`/числительному. DTMF тоже
+  перебивает воспроизведение, как и раньше.
+* **Потоковость TTS**: `AudioPlayer.play_stream()` проигрывает PCM по мере
+  прихода чанков, не дожидаясь синтеза всего текста.
+* Без `AITUNNEL_API_KEY` бот работает как раньше — только WAV-промпты и DTMF.
+
+Проверка без звонка:
+
+```powershell
+python -m app --tts-check "Здравствуйте! Это служба поддержки." --tts-output recordings/tts.wav
+python -m app --stt-check recordings/tts.wav
+```
+
+Учтите эхо: если АТС возвращает собственный звук бота обратно в медиапоток,
+barge-in может срабатывать ложно. В таком случае поднимите
+`VAD_RMS_THRESHOLD`/`VAD_START_MS` или отключите `VOICE_BARGE_IN`.
 
 ## Биллинг
 
@@ -244,19 +314,22 @@ python -m app --billing-check 1 --billing-mock   # тестовые данные
 ```
 
 Сумма пока не проговаривается голосом: в проекте только тоновые заглушки
-промптов, поэтому шаг сообщает об успехе/неудаче запроса. Для озвучивания
-суммы нужны либо записи диктора с цифрами, либо TTS (следующий этап).
+промптов, поэтому шаг сообщает об успехе/неудаче запроса. Чтобы озвучить
+баланс, добавьте в шаг `text` (или запишите промпт диктором) — текст уйдёт в
+AITUNNEL TTS. Шаблоны с подстановкой суммы появятся вместе с LLM-этапом.
 
 ## Промпты
 
 * **WAV** — PCM 8/16/24/32 бита, любое число каналов и любая частота
   (приводится к 8 кГц, моно, 16 бит при загрузке);
-* **сырой PCM Asterisk**: `.sln` (8 кГц), `.sln16` (16 кГц), `.pcm`, `.raw`.
+* **сырой PCM Asterisk**: `.sln` (8 кГц), `.sln16` (16 кГц), `.pcm`, `.raw`;
+* **TTS** — поле `text` шага; используется, когда WAV-промпта нет.
 
 `prompts/placeholder` — сгенерированные тоновые заглушки (в git не попадают).
-Реальные записи диктора или TTS кладите в `prompts/ru` и указывайте
-`PROMPTS_DIR=prompts/ru`. Отсутствующий промпт не роняет бота: шаг прозвучит
-«в тишину», а в лог уйдёт предупреждение.
+Реальные записи диктора кладите в `prompts/ru` и указывайте
+`PROMPTS_DIR=prompts/ru`. Отсутствующий промпт не роняет бота: если у шага есть
+`text`, он озвучивается через AITUNNEL, иначе шаг прозвучит «в тишину», а в лог
+уйдёт предупреждение.
 
 ## Записи и метаданные
 
@@ -265,7 +338,8 @@ python -m app --billing-check 1 --billing-mock   # тестовые данные
 * `<uuid>.wav` — входящий звук абонента (8 кГц, моно, 16 бит), где `uuid` —
   значение `data` из ExternalMedia;
 * `<uuid>.json` — сценарий, канал ARI, номер абонента, время, длительность,
-  число аудиофреймов, DTMF, шаги, причина завершения и ответ биллинга
+  число аудиофреймов, DTMF, шаги, распознанные реплики, число barge-in,
+  объём TTS, причина завершения и ответ биллинга
   (`billing`: `outcome`, `user_id`, баланс, тариф, дни, состояние сети).
 
 ```json
@@ -275,8 +349,13 @@ python -m app --billing-check 1 --billing-mock   # тестовые данные
   "caller": "79001112233",
   "scenario": "default",
   "duration_seconds": 24.7,
-  "dtmf": "0",
+  "dtmf": "",
   "steps": ["greeting", "menu", "balance", "menu", "operator"],
+  "transcripts": ["баланс", "оператор"],
+  "partial_transcripts": ["бала", "баланс"],
+  "barge_ins": 2,
+  "tts_characters": 0,
+  "speech_errors": 0,
   "hangup_reason": "hangup_step",
   "billing": {
     "outcome": "found",
@@ -297,7 +376,7 @@ python -m app --billing-check 1 --billing-mock   # тестовые данные
 ## Проверка без АТС
 
 ```powershell
-python -m pytest                 # 79 тестов, фейковый ARI, TCP и биллинг
+python -m pytest                 # 107 тестов: ARI, TCP, биллинг, речь/VAD
 ```
 
 Автономный режим (без Asterisk, для отладки сценария):
@@ -313,7 +392,7 @@ python tools/simulate_call.py --digits 0 --save recordings/prompts.wav
 
 ```
 app/
-  __main__.py            запуск, --ari-check, --billing-check, --check, --no-ari
+  __main__.py            запуск, --ari-check, --billing-check, --tts-check, --stt-check
   config.py              настройки из .env
   logging_setup.py       логи + маскирование секретов
   network.py             локальные IPv4 для подсказок
@@ -325,18 +404,22 @@ app/
     protocol.py          фреймы AudioSocket, чтение UUID
     registry.py          связка «UUID ↔ вызов ARI»
     server.py            TCP-сервер, по сессии на соединение
-    session.py           диалог, промпты, запись, DTMF, запрос в биллинг
+    session.py           диалог, промпты, VAD/STT, barge-in, запись, биллинг
   billing/
     client.py            POST {"userId": ...} + Bearer, разбор ответа
+  speech/
+    client.py            AITUNNEL STT/TTS, поток PCM и ресемплинг
+    vad.py               RMS-VAD и эндпоинтинг
+    streaming.py         сбор реплики, пре-ролл, промежуточные гипотезы
   audio/                 PCM, ресемплинг, проигрыватель, запись
-  dialog/                сценарий и промпты
+  dialog/                сценарий, промпты, голосовые интенты
 asterisk/README.md       что настроено на стороне Asterisk
 scenarios/default.json   сценарий по умолчанию
 tools/
   make_placeholder_prompts.py  заглушки промптов
   simulate_call.py             симулятор АТС (автономный режим)
   check_external_media.py      проверка доступности ExternalMedia
-tests/                   79 тестов
+tests/                   107 тестов
 ```
 
 ## Тесты
@@ -348,8 +431,11 @@ python -m pytest
 Покрыто: протокол и аудио, сценарий и промпты, настройки и CLI, ARI REST-клиент,
 клиент биллинга (контракт, 400/5xx/не-JSON, mock), выбор промпта по ответу
 биллинга, реконнект WebSocket, реестр ожидающих вызовов, сквозной вызов
-«StasisStart → бридж → ExternalMedia → AudioSocket по UUID → DTMF → очистка»,
-отклонение неизвестного UUID, автономный режим с симулятором.
+«StasisStart → бридж → ExternalMedia → AudioSocket по UUID → DTMF/голос →
+очистка», отклонение неизвестного UUID, автономный режим с симулятором.
+Речь: VAD/эндпоинтинг, пре-ролл и промежуточные гипотезы, сопоставление фраз
+и числительных, barge-in по голосу, TTS-поток в AudioSocket, fake-сервер
+AITUNNEL (multipart STT, чанки TTS, ошибки 4xx/5xx).
 
 ## Безопасность
 
@@ -360,12 +446,15 @@ python -m pytest
   списку IP, поэтому пароль нельзя публиковать.
 * AudioSocket не аутентифицирован: разрешайте входящие соединения только с
   `91.195.230.13`.
-* Записи разговоров содержат персональные данные — ограничьте доступ к
-  `RECORDINGS_DIR` и задайте срок хранения.
+* Записи разговоров и расшифровки STT содержат персональные данные —
+  ограничьте доступ к `RECORDINGS_DIR` и задайте срок хранения; ключ AITUNNEL
+  храните только в `.env`/секрет-хранилище.
+* Для чувствительных данных у AITUNNEL можно запросить провайдеров с нулевым
+  хранением (ZDR), но записи всё равно уходят во внешний API — это надо
+  отразить в политике обработки ПДн.
 
 ## Дальнейшие этапы
 
-1. STT/TTS на русском (потоково), VAD и эндпоинтинг, barge-in по голосу.
-2. LLM + инструменты (баланс, статус услуги, заявка на выезд), RAG по регламентам.
-3. PostgreSQL для логов диалогов, метрики задержек, docker-compose с тестовой АТС.
-4. Перевод на TLS-эндпоинт ARI, когда провайдер его включит.
+1. LLM + инструменты (баланс, статус услуги, заявка на выезд), RAG по регламентам.
+2. PostgreSQL для логов диалогов, метрики задержек, docker-compose с тестовой АТС.
+3. Перевод на TLS-эндпоинт ARI, когда провайдер его включит.

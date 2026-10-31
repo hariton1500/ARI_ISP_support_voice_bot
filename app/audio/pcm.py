@@ -7,6 +7,7 @@ AudioSocket передаёт звук как 16-битный знаковый л
 
 from __future__ import annotations
 
+import io
 import wave
 from collections.abc import Iterator
 from pathlib import Path
@@ -128,3 +129,63 @@ def load_prompt(path: Path) -> bytes:
     raise ValueError(
         f"неподдерживаемый формат промпта {path.name!r}: ожидался WAV или sln/sln16/pcm"
     )
+
+
+def to_wav(pcm: bytes, *, sample_rate: int = SAMPLE_RATE) -> bytes:
+    """Упаковать PCM16 моно в WAV (для multipart-запроса STT)."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(CHANNELS)
+        wav.setsampwidth(SAMPLE_WIDTH)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm)
+    return buffer.getvalue()
+
+
+class PcmStreamResampler:
+    """Потоковый ресемплер: режет вход на блоки по 20 мс и приводит к 8 кГц.
+
+    TTS отдаёт PCM 24 кГц кусками произвольного размера. Ресемплировать каждый
+    кусок отдельно нельзя — на стыках появятся щелчки. Поэтому куски сначала
+    собираются в блоки фиксированной длительности, а остаток отдаётся flush().
+    """
+
+    def __init__(
+        self,
+        src_rate: int,
+        dst_rate: int = SAMPLE_RATE,
+        *,
+        block_ms: int = FRAME_MS,
+    ) -> None:
+        if src_rate <= 0 or dst_rate <= 0:
+            raise ValueError("частота дискретизации должна быть положительной")
+        if block_ms <= 0:
+            raise ValueError("block_ms должен быть положительным")
+        self.src_rate = src_rate
+        self.dst_rate = dst_rate
+        self._block_bytes = max(
+            SAMPLE_WIDTH, src_rate * block_ms // 1000 * SAMPLE_WIDTH
+        )
+        self._buffer = bytearray()
+
+    def feed(self, data: bytes) -> list[bytes]:
+        """Добавить кусок и вернуть готовые блоки PCM 8 кГц."""
+        if data:
+            self._buffer += data
+        blocks: list[bytes] = []
+        while len(self._buffer) >= self._block_bytes:
+            block = bytes(self._buffer[: self._block_bytes])
+            del self._buffer[: self._block_bytes]
+            blocks.append(resample(block, self.src_rate, self.dst_rate))
+        return blocks
+
+    def flush(self) -> bytes:
+        """Отдать остаток (неполный блок) и очистить буфер."""
+        if not self._buffer:
+            return b""
+        data = bytes(self._buffer)
+        self._buffer.clear()
+        data = data[: len(data) - len(data) % SAMPLE_WIDTH]
+        if not data:
+            return b""
+        return resample(data, self.src_rate, self.dst_rate)

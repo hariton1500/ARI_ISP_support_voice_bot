@@ -2,19 +2,21 @@
 
 Сценарий — это JSON-файл с именованными шагами. Шаг умеет:
   * проиграть промпт (`prompt` — имя файла относительно PROMPTS_DIR);
+  * озвучить `text` через AITUNNEL TTS, если WAV-промпта нет;
   * принять DTMF-цифру и перейти на другой шаг (`dtmf`);
-  * перейти на шаг без ожидания цифры (`next`);
-  * обработать отсутствие ввода (`on_timeout`) и неверную цифру (`on_invalid`);
+  * принять распознанную фразу (`voice`: фраза -> шаг) или числительное;
+  * перейти на шаг без ожидания ввода (`next`);
+  * обработать отсутствие ввода (`on_timeout`) и неверный ввод (`on_invalid`);
   * завершить вызов (`hangup`);
   * запросить абонента в биллинге перед промптом (`billing`: `"caller"` или
     конкретный `userId`) и выбрать промпт по результату
     (`prompt_not_found` / `prompt_error`).
 
 Логика обработки ввода:
-  1. цифра есть в `dtmf` — переход по карте;
-  2. цифры нет за `timeout_ms` или пришла неверная цифра — счётчик попыток
-     растёт, шаг повторяется (промпт играется заново);
-  3. после `max_attempts` попыток — переход на `on_invalid` (неверная цифра)
+  1. цифра есть в `dtmf` или фраза есть в `voice` — переход по карте;
+  2. ввода нет за `timeout_ms` или он не распознан — счётчик попыток растёт,
+     шаг повторяется (промпт играется заново);
+  3. после `max_attempts` попыток — переход на `on_invalid` (неверный ввод)
      или `on_timeout` (нет ввода); если нужного перехода нет, берётся
      `on_timeout`, а если нет и его — вызов завершается.
 """
@@ -22,7 +24,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -56,6 +58,10 @@ class Step:
     prompt_not_found: str | None = None
     #: Промпт, если биллинг недоступен (по умолчанию — `prompt`).
     prompt_error: str | None = None
+    #: Текст для TTS, если WAV-промпта нет (AITUNNEL /audio/speech).
+    text: str | None = None
+    #: Голосовые команды: нормализованная фраза -> имя шага.
+    voice: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +144,9 @@ class Scenario:
             if step.on_invalid:
                 targets.append(("on_invalid", step.on_invalid))
             targets.extend((f"dtmf[{digit}]", target) for digit, target in step.dtmf.items())
+            targets.extend(
+                (f"voice[{phrase}]", target) for phrase, target in step.voice.items()
+            )
             for field_name, target in targets:
                 if target not in self.steps:
                     errors.append(
@@ -184,6 +193,17 @@ def _parse_step(step_name: str, raw: Any) -> Step:
             f"{where}: prompt_not_found/prompt_error задаются только вместе с billing"
         )
 
+    raw_voice = raw.get("voice") or {}
+    if not isinstance(raw_voice, dict):
+        raise ScenarioError(f"{where}: voice должен быть объектом")
+    voice: dict[str, str] = {}
+    for phrase, target in raw_voice.items():
+        if not isinstance(phrase, str) or not phrase.strip():
+            raise ScenarioError(f"{where}: голосовая фраза должна быть непустой строкой")
+        if not isinstance(target, str) or not target.strip():
+            raise ScenarioError(f"{where}: для фразы {phrase!r} не указан шаг перехода")
+        voice[phrase.strip()] = target.strip()
+
     return Step(
         name=step_name,
         label=_as_str(raw.get("label"), where, "label", default=step_name),
@@ -198,6 +218,8 @@ def _parse_step(step_name: str, raw: Any) -> Step:
         billing=billing,
         prompt_not_found=prompt_not_found,
         prompt_error=prompt_error,
+        text=_as_optional_str(raw.get("text"), where, "text"),
+        voice=MappingProxyType(voice),
     )
 
 

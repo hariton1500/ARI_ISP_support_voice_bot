@@ -20,6 +20,18 @@
         "9": "menu_repeat",
         "0": "operator"
       },
+      "voice": {
+        "баланс": "balance",
+        "проверить баланс": "balance",
+        "техподдержка": "tech_support",
+        "тех поддержка": "tech_support",
+        "интернет не работает": "tech_support",
+        "оплата": "payment",
+        "оплатить": "payment",
+        "оператор": "operator",
+        "соедините с оператором": "operator",
+        "повторите меню": "menu_repeat"
+      },
       "on_invalid": "invalid_digit",
       "on_timeout": "no_input"
     },

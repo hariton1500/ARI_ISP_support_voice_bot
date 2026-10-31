@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import numpy as np
 
 from app.audiosocket.protocol import (
     Frame,
@@ -288,3 +289,172 @@ def test_billing_step_without_client_uses_error_prompt(tmp_path: Path) -> None:
     assert total == 16000
     assert meta["billing"]["outcome"] == "error"
     assert meta["billing"]["reason"] == "not_configured"
+
+
+# ------------------------------------------------------- голос: VAD и barge-in
+
+
+class _FakeSpeech:
+    """Заглушка AITUNNEL: расшифровка и потоковый TTS без сети."""
+
+    def __init__(self, text: str = "Соедините с оператором", tts_pcm: bytes = b"") -> None:
+        self.text = text
+        self.tts_pcm = tts_pcm
+        self.transcriptions: list[bytes] = []
+        self.tts_texts: list[str] = []
+
+    async def transcribe(
+        self, pcm: bytes, *, sample_rate: int = 8000, language: str | None = None
+    ) -> str:
+        self.transcriptions.append(pcm)
+        return self.text
+
+    async def stream_tts(
+        self, text: str, *, voice: str | None = None, model: str | None = None
+    ):
+        self.tts_texts.append(text)
+        yield self.tts_pcm
+
+
+def _tone_frame(amplitude: float = 0.8) -> bytes:
+    count = 160  # 20 мс при 8 кГц
+    time = np.arange(count) / 8000
+    samples = (np.sin(2 * np.pi * 440 * time) * amplitude * 32767).astype("<i2")
+    return samples.tobytes()
+
+
+def _silence_frame() -> bytes:
+    return b"\x00" * 320
+
+
+def _voice_scenario(text_only: bool = False) -> Scenario:
+    greeting: dict[str, Any] = (
+        {"text": "Здравствуйте! Это служба поддержки.", "hangup": True}
+        if text_only
+        else {"prompt": "greeting.wav", "next": "menu"}
+    )
+    return Scenario.from_dict(
+        {
+            "name": "voice",
+            "initial": "greeting",
+            "steps": {
+                "greeting": greeting,
+                "menu": {
+                    "prompt": "menu.wav",
+                    "timeout_ms": 3000,
+                    "max_attempts": 2,
+                    "dtmf": {"0": "operator", "1": "operator"},
+                    "voice": {"оператор": "operator", "соедините с оператором": "operator"},
+                    "on_timeout": "operator",
+                    "on_invalid": "operator",
+                },
+                "operator": {"prompt": "operator.wav", "hangup": True},
+            },
+        }
+    )
+
+
+def _voice_settings(tmp_path: Path, prompts_dir: Path) -> Settings:
+    return Settings(
+        audiosocket_host="127.0.0.1",
+        audiosocket_port=0,
+        scenario_path=tmp_path / "scenario.json",
+        prompts_dir=prompts_dir,
+        record_calls=True,
+        recordings_dir=tmp_path / "recordings",
+        init_timeout=3.0,
+        idle_timeout=5.0,
+        max_call_seconds=20.0,
+        log_level="WARNING",
+        vad_start_ms=60,
+        vad_silence_ms=200,
+        vad_min_speech_ms=60,
+        stt_partial_interval_ms=0,
+    )
+
+
+async def _voice_flow(tmp_path: Path, speech: _FakeSpeech) -> dict[str, Any]:
+    scenario = _voice_scenario()
+    prompts_dir = tmp_path / "voice-prompts"
+    write_wav(prompts_dir / "greeting.wav", duration_ms=1000)
+    write_wav(prompts_dir / "menu.wav", duration_ms=200)
+    write_wav(prompts_dir / "operator.wav", duration_ms=100)
+    prompts = load_prompts(scenario, prompts_dir)
+    settings = _voice_settings(tmp_path, prompts_dir)
+
+    channel_uuid = uuid.uuid4()
+    server = AudioSocketServer(settings, scenario, prompts, speech=speech)
+    await server.start()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.bound_port)
+        writer.write(encode_frame(FrameKind.UUID, channel_uuid.bytes))
+        await writer.drain()
+        await asyncio.sleep(0.1)  # приветствие уже играет
+
+        for _ in range(3):
+            writer.write(encode_audio(_silence_frame()))
+        for _ in range(15):
+            writer.write(encode_audio(_tone_frame()))
+        for _ in range(12):
+            writer.write(encode_audio(_silence_frame()))
+        await writer.drain()
+
+        await _read_until_eof(reader, timeout=10.0)
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    finally:
+        await server.close()
+
+    return json.loads(
+        (settings.recordings_dir / f"{channel_uuid}.json").read_text(encoding="utf-8")
+    )
+
+
+def test_voice_barge_in_and_transcript_transition(tmp_path: Path) -> None:
+    speech = _FakeSpeech()
+    meta = asyncio.run(_voice_flow(tmp_path, speech))
+
+    assert speech.transcriptions, "STT не вызывался"
+    assert meta["transcripts"] == ["Соедините с оператором"]
+    assert meta["barge_ins"] >= 1
+    assert meta["steps"] == ["greeting", "menu", "operator"]
+    assert meta["hangup_reason"] == "hangup_step"
+
+
+async def _tts_flow(tmp_path: Path) -> tuple[_FakeSpeech, list[Frame], dict[str, Any]]:
+    scenario = _voice_scenario(text_only=True)
+    prompts_dir = tmp_path / "tts-prompts"
+    prompts_dir.mkdir(parents=True)
+    prompts = load_prompts(scenario, prompts_dir)
+    settings = _voice_settings(tmp_path, prompts_dir)
+    speech = _FakeSpeech(tts_pcm=b"\x01\x00" * 1600)  # 100 мс при 8 кГц
+
+    channel_uuid = uuid.uuid4()
+    server = AudioSocketServer(settings, scenario, prompts, speech=speech)
+    await server.start()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.bound_port)
+        writer.write(encode_frame(FrameKind.UUID, channel_uuid.bytes))
+        await writer.drain()
+        frames = await _read_until_eof(reader, timeout=10.0)
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    finally:
+        await server.close()
+
+    meta = json.loads(
+        (settings.recordings_dir / f"{channel_uuid}.json").read_text(encoding="utf-8")
+    )
+    return speech, frames, meta
+
+
+def test_tts_text_step_streams_audio(tmp_path: Path) -> None:
+    speech, frames, meta = asyncio.run(_tts_flow(tmp_path))
+
+    assert speech.tts_texts == ["Здравствуйте! Это служба поддержки."]
+    total = sum(len(frame.payload) for frame in frames if frame.kind == FrameKind.AUDIO_8K)
+    assert total == 3200
+    assert meta["tts_characters"] == len("Здравствуйте! Это служба поддержки.")
+    assert meta["hangup_reason"] == "hangup_step"

@@ -129,6 +129,30 @@ class Settings:
     billing_timeout: float = 10.0
     billing_mock: bool = False
 
+    # Речь: AITUNNEL — OpenAI-совместимый API (STT /audio/transcriptions,
+    # TTS /audio/speech). Ключ sk-aitunnel-…; без него речь выключена.
+    ai_tunnel_api_key: str | None = None
+    ai_tunnel_base_url: str = "https://api.aitunnel.ru/v1"
+    stt_model: str = "whisper-large-v3-turbo"
+    tts_model: str = "gpt-4o-mini-tts"
+    tts_voice: str = "nova"
+    tts_format: str = "pcm"
+    tts_pcm_rate: int = 24000
+    speech_language: str = "ru"
+    speech_timeout: float = 20.0
+
+    # VAD и эндпоинтинг (длительности в миллисекундах).
+    voice_input: bool = True
+    voice_barge_in: bool = True
+    vad_start_ms: int = 160
+    vad_silence_ms: int = 700
+    vad_min_speech_ms: int = 200
+    vad_rms_threshold: float = 300.0
+    vad_noise_multiplier: float = 2.5
+
+    #: 0 — не запрашивать промежуточные гипотезы STT.
+    stt_partial_interval_ms: int = 1200
+
     @classmethod
     def from_env(cls) -> Settings:
         return cls(
@@ -157,6 +181,23 @@ class Settings:
             billing_token=_get_optional_str("BILLING_TOKEN"),
             billing_timeout=_get_float("BILLING_TIMEOUT", 10.0),
             billing_mock=_get_bool("BILLING_MOCK", False),
+            ai_tunnel_api_key=_get_optional_str("AITUNNEL_API_KEY"),
+            ai_tunnel_base_url=_get_str("AITUNNEL_BASE_URL", "https://api.aitunnel.ru/v1"),
+            stt_model=_get_str("STT_MODEL", "whisper-large-v3-turbo"),
+            tts_model=_get_str("TTS_MODEL", "gpt-4o-mini-tts"),
+            tts_voice=_get_str("TTS_VOICE", "nova"),
+            tts_format=_get_str("TTS_FORMAT", "pcm").lower(),
+            tts_pcm_rate=_get_int("TTS_PCM_RATE", 24000),
+            speech_language=_get_str("SPEECH_LANGUAGE", "ru"),
+            speech_timeout=_get_float("SPEECH_TIMEOUT", 20.0),
+            voice_input=_get_bool("VOICE_INPUT", True),
+            voice_barge_in=_get_bool("VOICE_BARGE_IN", True),
+            vad_start_ms=_get_int("VAD_START_MS", 160),
+            vad_silence_ms=_get_int("VAD_SILENCE_MS", 700),
+            vad_min_speech_ms=_get_int("VAD_MIN_SPEECH_MS", 200),
+            vad_rms_threshold=_get_float("VAD_RMS_THRESHOLD", 300.0),
+            vad_noise_multiplier=_get_float("VAD_NOISE_MULTIPLIER", 2.5),
+            stt_partial_interval_ms=_get_int("STT_PARTIAL_INTERVAL_MS", 1200),
         )
 
     def with_overrides(self, **overrides: object) -> Settings:
@@ -176,6 +217,11 @@ class Settings:
     def billing_enabled(self) -> bool:
         """Биллинг готов: заданы адрес и токен либо включён BILLING_MOCK."""
         return bool(self.billing_base_url and self.billing_token) or self.billing_mock
+
+    @property
+    def speech_enabled(self) -> bool:
+        """AITUNNEL готов: есть ключ и не отключён голосовой ввод/синтез."""
+        return bool(self.ai_tunnel_api_key)
 
     @property
     def media_port(self) -> int:
@@ -198,7 +244,7 @@ class Settings:
         data: dict[str, object] = {}
         for field in self.__slots__:
             value = getattr(self, field)
-            secret = field in {"ari_password", "billing_token"}
+            secret = field in {"ari_password", "billing_token", "ai_tunnel_api_key"}
             data[field] = "***" if secret and value else value
         return data
 

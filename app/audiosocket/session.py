@@ -21,12 +21,14 @@ import logging
 import time
 import uuid as uuid_module
 from collections import deque
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
-from app.audio.pcm import FRAME_MS, SAMPLE_RATE, resample
+from app.audio.pcm import FRAME_MS, SAMPLE_RATE, resample, silence_ms
 from app.audio.playback import AudioPlayer
 from app.audio.recorder import WavRecorder
 from app.audiosocket.protocol import (
@@ -40,7 +42,7 @@ from app.audiosocket.protocol import (
 from app.audiosocket.registry import PendingCall
 from app.billing.client import BillingError, BillingLookup, Subscriber
 from app.config import Settings
-from app.dialog.intents import match_voice
+from app.dialog.intents import match_voice, normalize_text
 from app.dialog.prompts import PromptMap
 from app.dialog.scenario import Scenario, Step
 from app.llm.conversation import LLMBackend
@@ -52,6 +54,26 @@ from app.speech.vad import VadConfig, VadEventKind
 
 #: Что сказать, если LLM/AITUNNEL недоступны: без технических подробностей.
 LLM_ERROR_TEXT = "Извините, произошла техническая ошибка. Перевожу вас на оператора."
+
+#: Сколько секунд после реплики бота считать STT-текст возможным эхом.
+ECHO_WINDOW_SECONDS = 6.0
+#: Минимальная длина нормализованного текста для проверки на эхо.
+ECHO_MIN_CHARS = 8
+#: Порог похожести для отбрасывания эха.
+ECHO_SIMILARITY = 0.72
+
+
+def _similar_text(first: str, second: str) -> bool:
+    """Похож ли распознанный текст на недавнюю реплику бота (эхо)."""
+    left = normalize_text(first)
+    right = normalize_text(second)
+    if len(left.replace(" ", "")) < ECHO_MIN_CHARS:
+        return False
+    if len(right.replace(" ", "")) < ECHO_MIN_CHARS:
+        return False
+    if left in right or right in left:
+        return True
+    return SequenceMatcher(None, left, right).ratio() >= ECHO_SIMILARITY
 
 
 class InputBuffer:
@@ -111,6 +133,8 @@ class CallStats:
     barge_ins: int = 0
     tts_characters: int = 0
     speech_errors: int = 0
+    #: Отброшенные STT-фразы, похожие на собственные реплики бота.
+    ignored_echo: int = 0
     #: LLM: число реплик, вызовов инструментов, ошибок и озвученных ответов.
     llm_turns: int = 0
     llm_tool_calls: int = 0
@@ -158,6 +182,8 @@ class CallSession:
         self._transcripts = InputBuffer()
         self._input_changed = asyncio.Event()
         self._player = AudioPlayer(self._send_audio)
+        self._bot_speaking = False
+        self._recent_bot_texts: deque[tuple[str, float]] = deque(maxlen=8)
         self._voice: StreamingVoiceInput | None = None
         if speech is not None and settings.voice_input:
             self._voice = StreamingVoiceInput(
@@ -311,9 +337,15 @@ class CallSession:
     # ------------------------------------------------------- речь: VAD/STT
 
     def _feed_voice(self, pcm: bytes) -> None:
-        """Прогнать звук через VAD, собрать реплику и запустить STT."""
+        """Прогнать звук через VAD, собрать реплику и запустить STT.
+
+        При включённом echo guard звук не подаётся в VAD, пока бот говорит:
+        иначе собственный промпт/TTS распознаётся как реплика абонента.
+        """
         voice = self._voice
         if voice is None:
+            return
+        if self._settings.voice_echo_guard and self._bot_speaking:
             return
         event = voice.feed(pcm)
         if event is not None and event.kind is VadEventKind.START:
@@ -343,6 +375,23 @@ class CallSession:
             self._spawn_stt(self._transcribe(event.pcm, final=True))
         elif voice.is_speaking and voice.partial_due():
             self._request_partial()
+
+    def _remember_bot_text(self, text: str | None) -> None:
+        """Запомнить произнесённую ботом фразу для фильтра эха."""
+        normalized = normalize_text(text or "")
+        if not normalized:
+            return
+        self._recent_bot_texts.append((normalized, time.monotonic()))
+
+    def _is_echo_text(self, text: str) -> bool:
+        """Похож ли STT-текст на недавнюю реплику бота."""
+        moment = time.monotonic()
+        for candidate, stamp in reversed(self._recent_bot_texts):
+            if moment - stamp > ECHO_WINDOW_SECONDS:
+                continue
+            if _similar_text(text, candidate):
+                return True
+        return False
 
     def _request_partial(self) -> None:
         """Отправить накопленную речь в STT, не дожидаясь конца реплики."""
@@ -382,6 +431,10 @@ class CallSession:
             return
         text = " ".join(text.split())
         if not text:
+            return
+        if self._settings.voice_echo_guard and self._is_echo_text(text):
+            self._stats.ignored_echo += 1
+            self._log.info("вызов %s: STT-эхо отброшено: %r", self.session_id, text)
             return
         if final:
             self._stats.transcripts.append(text)
@@ -701,7 +754,19 @@ class CallSession:
         name = prompt if prompt is not None else step.prompt
         pcm = self._prompts.get(name) if name else None
         if pcm:
-            completed = await self._player.play(pcm)
+            lead_in = silence_ms(self._settings.playback_lead_in_ms)
+            if lead_in:
+                pcm = lead_in + pcm
+            self._remember_bot_text(step.text)
+            self._bot_speaking = True
+            if self._voice is not None:
+                self._voice.reset()
+            try:
+                completed = await self._player.play(pcm)
+            finally:
+                self._bot_speaking = False
+                if self._voice is not None:
+                    self._voice.reset()
             if not completed:
                 self._log.debug(
                     "вызов %s: промпт шага %s прерван", self.session_id, step.name
@@ -730,8 +795,19 @@ class CallSession:
             )
             return
         self._stats.tts_characters += len(text)
+        async def with_lead_in() -> AsyncIterator[bytes]:
+            lead_in = silence_ms(self._settings.playback_lead_in_ms)
+            if lead_in:
+                yield lead_in
+            async for chunk in speech.stream_tts(text):
+                yield chunk
+
+        self._remember_bot_text(text)
+        self._bot_speaking = True
+        if self._voice is not None:
+            self._voice.reset()
         try:
-            completed = await self._player.play_stream(speech.stream_tts(text))
+            completed = await self._player.play_stream(with_lead_in())
         except asyncio.CancelledError:
             raise
         except SpeechError as exc:
@@ -744,6 +820,10 @@ class CallSession:
                 "вызов %s: шаг %s, неожиданная ошибка TTS", self.session_id, step_name
             )
             return
+        finally:
+            self._bot_speaking = False
+            if self._voice is not None:
+                self._voice.reset()
         if not completed:
             self._log.debug(
                 "вызов %s: TTS шага %s прерван (barge-in)", self.session_id, step_name
@@ -904,6 +984,7 @@ class CallSession:
             "transcripts": list(self._stats.transcripts),
             "partial_transcripts": list(self._stats.partial_transcripts),
             "barge_ins": self._stats.barge_ins,
+            "ignored_echo": self._stats.ignored_echo,
             "tts_characters": self._stats.tts_characters,
             "speech_errors": self._stats.speech_errors,
             "llm_turns": self._stats.llm_turns,

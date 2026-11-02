@@ -1,7 +1,9 @@
 # Звук и сценарии работают на asyncio из стандартной библиотеки.
-# numpy — ресемплинг и подготовка PCM-промптов,
+# numpy — подготовка PCM и VAD,
+# soxr — качественный потоковый ресемплинг с anti-alias-фильтром,
 # python-dotenv — настройки из .env,
 # aiohttp — клиент ARI (WebSocket + REST), биллинг, AITUNNEL STT/TTS и LLM.
 numpy>=1.26,<3
+soxr>=1.0,<2
 python-dotenv>=1.0,<2
 aiohttp>=3.9,<4

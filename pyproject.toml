@@ -5,6 +5,7 @@ description = "Голосовой бот службы поддержки або�
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26,<3",
+    "soxr>=1.0,<2",
     "python-dotenv>=1.0,<2",
     "aiohttp>=3.9,<4",
 ]

@@ -123,14 +123,50 @@ def test_player_stop_interrupts_playback() -> None:
 def test_pcm_stream_resampler_handles_arbitrary_chunks() -> None:
     source = (np.ones(2400, dtype="<i2") * 7).tobytes()  # 100 мс при 24 кГц
     resampler = PcmStreamResampler(24000, 8000)
-    output = b""
+    chunks: list[bytes] = []
     for offset in range(0, len(source), 333):
-        output += b"".join(resampler.feed(source[offset : offset + 333]))
-    output += resampler.flush()
+        produced = resampler.feed(source[offset : offset + 333])
+        assert all(len(chunk) == FRAME_BYTES for chunk in produced)
+        chunks.extend(produced)
+    output = b"".join(chunks) + resampler.flush()
     assert abs(len(output) - 1600) <= 4
     samples = np.frombuffer(output, dtype="<i2")
     assert samples.size > 0
-    assert samples.max() - samples.min() <= 2
+    # У IIR/FIR-фильтра есть небольшой переходный процесс на краях сигнала.
+    steady = samples[20:-20]
+    assert steady.max() - steady.min() <= 2
+
+
+def test_pcm_stream_resampler_matches_one_shot_with_irregular_chunks() -> None:
+    time = np.arange(2400) / 24000
+    source_samples = (
+        9000 * np.sin(2 * np.pi * 440 * time)
+        + 2500 * np.sin(2 * np.pi * 2500 * time)
+    ).astype("<i2")
+    source = source_samples.tobytes()
+    expected = np.frombuffer(resample(source, 24000, 8000), dtype="<i2")
+
+    resampler = PcmStreamResampler(24000, 8000)
+    chunks: list[bytes] = []
+    for offset in range(0, len(source), 353):
+        chunks.extend(resampler.feed(source[offset : offset + 353]))
+    chunks.append(resampler.flush())
+    actual = np.frombuffer(b"".join(chunks), dtype="<i2")
+
+    assert actual.size == expected.size
+    # Streaming и one-shot режимы SoXR могут различаться только округлением PCM16.
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=2)
+
+
+def test_resample_suppresses_aliasing() -> None:
+    # 7 кГц выше частоты Найквиста для 8 кГц: без anti-alias-фильтра
+    # такой тон заворачивается в слышимый 1 кГц и даёт металлический призвук.
+    time = np.arange(2400) / 24000
+    source = (12000 * np.sin(2 * np.pi * 7000 * time)).astype("<i2").tobytes()
+    result = resample(source, 24000, 8000)
+    samples = np.frombuffer(result, dtype="<i2").astype(np.float64)
+    rms = np.sqrt(np.mean(samples**2))
+    assert rms < 100  # более чем на 40 дБ ниже исходного тона
 
 
 def test_to_wav_roundtrip() -> None:

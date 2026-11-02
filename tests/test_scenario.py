@@ -38,7 +38,6 @@ def test_llm_first_scenario_is_valid() -> None:
     dialog = scenario.steps["dialog"]
     assert dialog.llm is True
     assert dialog.dtmf == {
-        "1": "balance",
         "2": "tech_support",
         "3": "payment",
         "0": "operator",
@@ -50,10 +49,9 @@ def test_llm_first_scenario_is_valid() -> None:
     assert "dialog.wav" in scenario.prompt_names
 
 
-def test_llm_first_scenario_has_billing_and_no_duplicate_prompts() -> None:
+def test_llm_first_scenario_does_not_use_billing_steps() -> None:
     scenario = Scenario.load(LLM_FIRST_SCENARIO)
-    assert scenario.steps["balance"].billing == "caller"
-    assert scenario.steps["balance"].next == "dialog"
+    assert all(step.billing is None for step in scenario.steps.values())
     assert len(scenario.prompt_names) == len(set(scenario.prompt_names))
 
 

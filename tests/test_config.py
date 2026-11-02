@@ -87,6 +87,8 @@ def test_speech_settings(monkeypatch) -> None:
         "TTS_VOICE",
         "VOICE_INPUT",
         "VOICE_BARGE_IN",
+        "VOICE_ECHO_GUARD",
+        "PLAYBACK_LEAD_IN_MS",
         "VAD_START_MS",
         "VAD_SILENCE_MS",
         "VAD_MIN_SPEECH_MS",
@@ -100,17 +102,23 @@ def test_speech_settings(monkeypatch) -> None:
     assert settings.tts_pcm_rate == 24000
     assert settings.voice_input is True
     assert settings.voice_barge_in is True
+    assert settings.voice_echo_guard is True
+    assert settings.playback_lead_in_ms == 150
     assert settings.vad_silence_ms == 700
 
     monkeypatch.setenv("AITUNNEL_API_KEY", "sk-aitunnel-secret")
     monkeypatch.setenv("AITUNNEL_BASE_URL", "https://ru-api.aitunnel.ru/v1")
     monkeypatch.setenv("VOICE_BARGE_IN", "false")
+    monkeypatch.setenv("VOICE_ECHO_GUARD", "false")
+    monkeypatch.setenv("PLAYBACK_LEAD_IN_MS", "0")
     monkeypatch.setenv("VAD_SILENCE_MS", "900")
     monkeypatch.setenv("STT_PARTIAL_INTERVAL_MS", "0")
     settings = Settings.from_env()
     assert settings.speech_enabled is True
     assert settings.ai_tunnel_base_url == "https://ru-api.aitunnel.ru/v1"
     assert settings.voice_barge_in is False
+    assert settings.voice_echo_guard is False
+    assert settings.playback_lead_in_ms == 0
     assert settings.vad_silence_ms == 900
     assert settings.stt_partial_interval_ms == 0
     assert settings.masked()["ai_tunnel_api_key"] == "***"

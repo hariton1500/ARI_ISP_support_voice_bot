@@ -81,6 +81,9 @@ class AudioPlayer:
                 deadline += self._frame_seconds
                 delay = deadline - loop.time()
                 if delay <= 0:
+                    # Не догонять отставание пачкой кадров: иначе Asterisk
+                    # получает burst и может выбросить начало фразы.
+                    deadline = loop.time()
                     continue
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=delay)

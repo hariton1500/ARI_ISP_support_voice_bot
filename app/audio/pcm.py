@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
+import soxr
 
 # Формат обмена с Asterisk (AudioSocket, фрейм 0x10).
 SAMPLE_RATE = 8000
@@ -52,25 +53,18 @@ def duration_ms(pcm: bytes) -> float:
 
 
 def resample(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
-    """Линейный ресемплинг 16-битного моно PCM."""
+    """Качественный ресемплинг PCM16 mono с подавлением aliasing."""
     if src_rate == dst_rate or not pcm:
         return pcm
     if src_rate <= 0 or dst_rate <= 0:
         raise ValueError("частота дискретизации должна быть положительной")
 
+    pcm = pcm[: len(pcm) - len(pcm) % SAMPLE_WIDTH]
     samples = np.frombuffer(pcm, dtype=PCM16_DTYPE)
     if samples.size == 0:
         return b""
-    if samples.size == 1:
-        return pcm
-
-    out_len = max(1, int(round(samples.size * dst_rate / src_rate)))
-    positions = np.linspace(0.0, samples.size - 1, out_len, dtype=np.float64)
-    left = np.floor(positions).astype(np.int64)
-    frac = positions - left
-    right = np.minimum(left + 1, samples.size - 1)
-    values = samples[left] * (1.0 - frac) + samples[right] * frac
-    return np.clip(np.rint(values), -32768, 32767).astype(PCM16_DTYPE).tobytes()
+    converted = soxr.resample(samples, src_rate, dst_rate, quality="VHQ")
+    return converted.astype(PCM16_DTYPE, copy=False).tobytes()
 
 
 def _to_mono_pcm16(data: bytes, sample_width: int, channels: int) -> bytes:
@@ -143,11 +137,12 @@ def to_wav(pcm: bytes, *, sample_rate: int = SAMPLE_RATE) -> bytes:
 
 
 class PcmStreamResampler:
-    """Потоковый ресемплер: режет вход на блоки по 20 мс и приводит к 8 кГц.
+    """Потоковый SoXR с сохранением состояния фильтра между любыми чанками.
 
-    TTS отдаёт PCM 24 кГц кусками произвольного размера. Ресемплировать каждый
-    кусок отдельно нельзя — на стыках появятся щелчки. Поэтому куски сначала
-    собираются в блоки фиксированной длительности, а остаток отдаётся flush().
+    Входной PCM16 mono может приходить кусками произвольного размера, включая
+    нечётное число байт. На выходе формируются блоки по ``block_ms``, чтобы
+    AudioPlayer сохранял темп 20 мс. ``flush()`` выводит задержанный фильтром
+    остаток; повторно использовать завершённый экземпляр нельзя.
     """
 
     def __init__(
@@ -164,28 +159,64 @@ class PcmStreamResampler:
         self.src_rate = src_rate
         self.dst_rate = dst_rate
         self._block_bytes = max(
-            SAMPLE_WIDTH, src_rate * block_ms // 1000 * SAMPLE_WIDTH
+            SAMPLE_WIDTH, dst_rate * block_ms // 1000 * SAMPLE_WIDTH
         )
-        self._buffer = bytearray()
+        self._input = bytearray()
+        self._output = bytearray()
+        self._finished = False
+        self._stream: soxr.ResampleStream | None = None
+        if src_rate != dst_rate:
+            self._stream = soxr.ResampleStream(
+                src_rate,
+                dst_rate,
+                1,
+                dtype="int16",
+                quality="VHQ",
+            )
 
-    def feed(self, data: bytes) -> list[bytes]:
-        """Добавить кусок и вернуть готовые блоки PCM 8 кГц."""
-        if data:
-            self._buffer += data
+    def _process(self, data: bytes, *, last: bool = False) -> None:
+        if self._stream is None:
+            self._output += data
+            return
+        samples = (
+            np.frombuffer(data, dtype=PCM16_DTYPE)
+            if data
+            else np.empty(0, dtype=PCM16_DTYPE)
+        )
+        converted = self._stream.resample_chunk(samples, last=last)
+        self._output += converted.astype(PCM16_DTYPE, copy=False).tobytes()
+
+    def _take_blocks(self) -> list[bytes]:
         blocks: list[bytes] = []
-        while len(self._buffer) >= self._block_bytes:
-            block = bytes(self._buffer[: self._block_bytes])
-            del self._buffer[: self._block_bytes]
-            blocks.append(resample(block, self.src_rate, self.dst_rate))
+        while len(self._output) >= self._block_bytes:
+            block = bytes(self._output[: self._block_bytes])
+            del self._output[: self._block_bytes]
+            blocks.append(block)
         return blocks
 
+    def feed(self, data: bytes) -> list[bytes]:
+        """Добавить кусок PCM и вернуть готовые выходные блоки."""
+        if self._finished:
+            raise RuntimeError("нельзя продолжить поток после flush()")
+        if data:
+            self._input += data
+        size = len(self._input) - len(self._input) % SAMPLE_WIDTH
+        if not size:
+            return []
+        block = bytes(self._input[:size])
+        del self._input[:size]
+        self._process(block)
+        return self._take_blocks()
+
     def flush(self) -> bytes:
-        """Отдать остаток (неполный блок) и очистить буфер."""
-        if not self._buffer:
+        """Завершить поток и вернуть остаток, включая задержку фильтра."""
+        if self._finished:
             return b""
-        data = bytes(self._buffer)
-        self._buffer.clear()
-        data = data[: len(data) - len(data) % SAMPLE_WIDTH]
-        if not data:
-            return b""
-        return resample(data, self.src_rate, self.dst_rate)
+        self._finished = True
+        size = len(self._input) - len(self._input) % SAMPLE_WIDTH
+        data = bytes(self._input[:size])
+        self._input.clear()
+        self._process(data, last=True)
+        tail = bytes(self._output)
+        self._output.clear()
+        return tail

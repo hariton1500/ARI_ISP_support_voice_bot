@@ -144,6 +144,11 @@ class Settings:
     # VAD и эндпоинтинг (длительности в миллисекундах).
     voice_input: bool = True
     voice_barge_in: bool = True
+    #: Не кормить VAD/STT собственным звуком бота и отбрасывать эхо-фразы.
+    voice_echo_guard: bool = True
+    #: Тишина перед каждой фразой бота: компенсирует потерю первых фреймов
+    #: на стыке ExternalMedia/моста и старт jitter-буфера Asterisk.
+    playback_lead_in_ms: int = 150
     vad_start_ms: int = 160
     vad_silence_ms: int = 700
     vad_min_speech_ms: int = 200
@@ -201,6 +206,8 @@ class Settings:
             speech_timeout=_get_float("SPEECH_TIMEOUT", 20.0),
             voice_input=_get_bool("VOICE_INPUT", True),
             voice_barge_in=_get_bool("VOICE_BARGE_IN", True),
+            voice_echo_guard=_get_bool("VOICE_ECHO_GUARD", True),
+            playback_lead_in_ms=_get_int("PLAYBACK_LEAD_IN_MS", 150),
             vad_start_ms=_get_int("VAD_START_MS", 160),
             vad_silence_ms=_get_int("VAD_SILENCE_MS", 700),
             vad_min_speech_ms=_get_int("VAD_MIN_SPEECH_MS", 200),

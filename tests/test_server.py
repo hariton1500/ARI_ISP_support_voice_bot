@@ -23,6 +23,7 @@ from app.audiosocket.protocol import (
 )
 from app.audiosocket.registry import PendingCall, PendingRegistry
 from app.audiosocket.server import AudioSocketServer
+from app.audiosocket.session import _similar_text
 from app.billing.client import BillingError, Subscriber
 from app.config import PROJECT_ROOT, Settings
 from app.dialog.prompts import PromptMap, load_prompts
@@ -225,6 +226,7 @@ async def _billing_flow(
         idle_timeout=5.0,
         max_call_seconds=20.0,
         log_level="WARNING",
+        playback_lead_in_ms=0,
     )
 
     channel_uuid = uuid.uuid4()
@@ -370,6 +372,7 @@ def _voice_settings(tmp_path: Path, prompts_dir: Path) -> Settings:
         idle_timeout=5.0,
         max_call_seconds=20.0,
         log_level="WARNING",
+        playback_lead_in_ms=0,
         vad_start_ms=60,
         vad_silence_ms=200,
         vad_min_speech_ms=60,
@@ -382,6 +385,8 @@ async def _voice_flow(
     speech: _FakeSpeech,
     llm: Any = None,
     scenario: Scenario | None = None,
+    *,
+    echo_guard: bool = False,
 ) -> dict[str, Any]:
     prompts_dir = tmp_path / "voice-prompts"
     if scenario is None:
@@ -394,7 +399,9 @@ async def _voice_flow(
             write_wav(prompts_dir / name, duration_ms=200)
         write_wav(prompts_dir / "greeting.wav", duration_ms=1000)
     prompts = load_prompts(scenario, prompts_dir)
-    settings = _voice_settings(tmp_path, prompts_dir)
+    settings = _voice_settings(tmp_path, prompts_dir).with_overrides(
+        voice_echo_guard=echo_guard
+    )
 
     channel_uuid = uuid.uuid4()
     server = AudioSocketServer(settings, scenario, prompts, speech=speech, llm=llm)
@@ -434,6 +441,34 @@ def test_voice_barge_in_and_transcript_transition(tmp_path: Path) -> None:
     assert meta["barge_ins"] >= 1
     assert meta["steps"] == ["greeting", "menu", "operator"]
     assert meta["hangup_reason"] == "hangup_step"
+
+
+def test_echo_filter_detects_bot_prompt_and_reply_fragments() -> None:
+    assert _similar_text("Всем я еще могу.", "Чем я еще могу помочь?")
+    assert _similar_text(
+        "помочь вам сегодня.", "Здравствуйте! Как я могу помочь вам сегодня?"
+    )
+    assert not _similar_text("А сколько у меня на балансе?", "Чем я еще могу помочь?")
+    assert not _similar_text("20", "Чем я еще могу помочь?")
+
+
+def test_voice_echo_guard_ignores_speech_during_prompt(tmp_path: Path) -> None:
+    speech = _FakeSpeech(text="Всем я еще могу.")
+    scenario = _voice_scenario(llm=True, timeout_ms=150)
+    meta = asyncio.run(
+        _voice_flow(
+            tmp_path,
+            speech,
+            llm=_FakeLLM(),
+            scenario=scenario,
+            echo_guard=True,
+        )
+    )
+
+    assert meta["transcripts"] == []
+    assert meta["llm_turns"] == 0
+    assert meta["barge_ins"] == 0
+    assert meta["steps"] == ["greeting", "menu", "operator"]
 
 
 async def _tts_flow(tmp_path: Path) -> tuple[_FakeSpeech, list[Frame], dict[str, Any]]:

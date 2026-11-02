@@ -16,7 +16,6 @@
       "timeout_ms": 8000,
       "max_attempts": 2,
       "dtmf": {
-        "1": "balance",
         "2": "tech_support",
         "3": "payment",
         "0": "operator"
@@ -32,14 +31,6 @@
       "label": "нет ввода",
       "prompt": "no_input.wav",
       "next": "fallback"
-    },
-    "balance": {
-      "label": "баланс из биллинга",
-      "prompt": "balance.wav",
-      "prompt_not_found": "balance_not_found.wav",
-      "prompt_error": "balance_error.wav",
-      "billing": "caller",
-      "next": "dialog"
     },
     "tech_support": {
       "label": "техподдержка (заглушка)",

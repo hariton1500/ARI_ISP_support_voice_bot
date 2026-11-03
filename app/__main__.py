@@ -50,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", type=Path, default=None, help="путь к .env")
     parser.add_argument("--host", default=None, help="адрес прослушивания AudioSocket")
     parser.add_argument("--port", type=int, default=None, help="порт AudioSocket")
+    parser.add_argument(
+        "--voice-provider",
+        choices=("aitunnel", "yandex_realtime"),
+        default=None,
+        help="голосовой движок (по умолчанию VOICE_PROVIDER или aitunnel)",
+    )
     parser.add_argument("--scenario", type=Path, default=None, help="путь к JSON-сценарию")
     parser.add_argument("--prompts-dir", type=Path, default=None, help="каталог с промптами")
     parser.add_argument(
@@ -141,6 +147,7 @@ def _resolve_settings(args: argparse.Namespace) -> Settings:
     return settings.with_overrides(
         audiosocket_host=args.host,
         audiosocket_port=args.port,
+        voice_provider=args.voice_provider,
         scenario_path=args.scenario,
         prompts_dir=args.prompts_dir,
         llm_prompts_dir=args.llm_prompts_dir,
@@ -353,42 +360,53 @@ async def _serve(
             "задайте BILLING_BASE_URL и BILLING_TOKEN (или BILLING_MOCK=1)"
         )
 
+    realtime = settings.voice_provider == "yandex_realtime"
     speech: SpeechClient | None = None
-    if settings.speech_enabled:
-        speech = SpeechClient(settings, logger=log)
-        await speech.start()
+    llm: LLMClient | None = None
+    llm_needed = any(step.llm for step in scenario.steps.values())
+    if realtime:
         log.info(
-            "речь AITUNNEL: %s, STT %s, TTS %s/%s, VAD %d мс тишины%s",
-            settings.ai_tunnel_base_url,
-            settings.stt_model,
-            settings.tts_model,
-            settings.tts_voice,
+            "Yandex Realtime: модель %s, голос %s, PCM 16 кГц, VAD %d мс тишины; "
+            "логирование данных у провайдера: %s",
+            settings.yandex_realtime_model,
+            settings.yandex_realtime_voice,
             settings.vad_silence_ms,
-            ", barge-in вкл" if settings.voice_barge_in else ", barge-in выкл",
+            "вкл" if settings.yandex_data_logging else "выкл",
         )
     else:
-        log.warning(
-            "голосовые функции выключены: задайте AITUNNEL_API_KEY "
-            "(останется только DTMF)"
-        )
+        if settings.speech_enabled:
+            speech = SpeechClient(settings, logger=log)
+            await speech.start()
+            log.info(
+                "речь AITUNNEL: %s, STT %s, TTS %s/%s, VAD %d мс тишины%s",
+                settings.ai_tunnel_base_url,
+                settings.stt_model,
+                settings.tts_model,
+                settings.tts_voice,
+                settings.vad_silence_ms,
+                ", barge-in вкл" if settings.voice_barge_in else ", barge-in выкл",
+            )
+        else:
+            log.warning(
+                "голосовые функции выключены: задайте AITUNNEL_API_KEY "
+                "(свободный диалог будет недоступен)"
+            )
 
-    llm_needed = any(step.llm for step in scenario.steps.values())
-    llm: LLMClient | None = None
-    if llm_needed and settings.llm_enabled and llm_prompts is not None:
-        llm = LLMClient(settings, llm_prompts, logger=log)
-        await llm.start()
-        log.info(
-            "LLM AITUNNEL: модель %s, промптов %d (%d символов), "
-            "инструменты: get_billing_info, transfer_to_operator, end_call",
-            settings.llm_model,
-            llm_prompts.document_count,
-            llm_prompts.char_count,
-        )
-    elif llm_needed:
-        log.warning(
-            "в сценарии есть LLM-шаги, но LLM выключена: задайте AITUNNEL_API_KEY "
-            "и проверьте LLM_PROMPTS_DIR (останутся DTMF/voice-команды)"
-        )
+        if llm_needed and settings.llm_enabled and llm_prompts is not None:
+            llm = LLMClient(settings, llm_prompts, logger=log)
+            await llm.start()
+            log.info(
+                "LLM AITUNNEL: модель %s, промптов %d (%d символов), "
+                "инструменты: get_billing_info, transfer_to_operator, end_call",
+                settings.llm_model,
+                llm_prompts.document_count,
+                llm_prompts.char_count,
+            )
+        elif llm_needed:
+            log.warning(
+                "в сценарии есть LLM-шаги, но LLM выключена: задайте AITUNNEL_API_KEY "
+                "и проверьте LLM_PROMPTS_DIR (останутся только голосовые команды)"
+            )
 
     registry = PendingRegistry()
     server = AudioSocketServer(
@@ -399,6 +417,7 @@ async def _serve(
         billing=billing,
         speech=speech,
         llm=llm,
+        llm_prompts=llm_prompts,
     )
     await server.start()
     addresses = ", ".join(local_ipv4_addresses()) or "нет внешних адресов"
@@ -453,10 +472,21 @@ def main(argv: list[str] | None = None) -> int:
 
     setup_logging(
         settings.log_level,
-        secrets=(settings.ari_password, settings.billing_token, settings.ai_tunnel_api_key),
+        secrets=(
+            settings.ari_password,
+            settings.billing_token,
+            settings.ai_tunnel_api_key,
+            settings.yandex_api_key,
+        ),
     )
     log = logging.getLogger("app")
     log.debug("настройки: %s", settings.masked())
+
+    if settings.voice_provider == "yandex_realtime" and not settings.realtime_enabled:
+        log.error(
+            "Yandex Realtime выбран, но не заданы YANDEX_API_KEY и YANDEX_FOLDER_ID"
+        )
+        return 2
 
     use_ari = args.ari if args.ari is not None else settings.ari_enabled
     if use_ari and not settings.ari_enabled:
@@ -501,15 +531,16 @@ def main(argv: list[str] | None = None) -> int:
     prompts = load_prompts(scenario, settings.prompts_dir, log)
 
     llm_prompts: LLMPromptSet | None = None
-    llm_needed = any(step.llm for step in scenario.steps.values())
+    realtime = settings.voice_provider == "yandex_realtime"
+    llm_needed = realtime or any(step.llm for step in scenario.steps.values())
     if llm_needed:
         try:
             llm_prompts = load_llm_prompts(settings.llm_prompts_dir, log)
         except LLMPromptError as exc:
-            if settings.llm_enabled:
+            if realtime or settings.llm_enabled:
                 log.error("%s", exc)
                 return 2
-            log.warning("%s (LLM выключена, работают DTMF/voice)", exc)
+            log.warning("%s (LLM выключена, доступны только голосовые команды)", exc)
 
     if args.check:
         missing = [name for name in scenario.prompt_names if name not in prompts]

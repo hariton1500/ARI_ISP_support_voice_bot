@@ -1,47 +1,46 @@
 # PROJECT_SPEC — голосовой бот поддержки провайдера
 
-> **Назначение документа:** дать достаточно информации для функционального воссоздания проекта с нуля без чтения исходного кода.
+> **Назначение:** дать достаточно информации для функционального воссоздания проекта с нуля без чтения исходного кода.
 >
-> **Статус:** описание текущей рабочей копии проекта `ari-isp-support-voice-bot`, версия `0.3.0`. Актуализировано 02.11.2026.
+> **Статус:** текущая рабочая копия `ari-isp-support-voice-bot`, версия `0.4.0`. Актуализировано 02.11.2026: добавлен изолированный пилот Yandex Realtime; AITUNNEL остаётся режимом по умолчанию.
 >
-> **Важно:** документ не содержит пароли, API-ключи, токены и реальные записи абонентов. Для точной побайтовой копии нужен Git-репозиторий; этот документ описывает требования, поведение и контракты.
+> **Важно:** документ не содержит пароли, API-ключи, токены и реальные записи абонентов. Для побайтовой копии нужен Git-репозиторий; здесь описаны требования, поведение и контракты.
 
 ---
 
 ## 1. Краткое описание
 
-Сервис принимает телефонные звонки абонентов провайдера «Евпанет» и ведёт голосовой диалог на русском языке.
+Сервис принимает телефонные звонки абонентов провайдера «Евпанет» и ведёт свободный голосовой диалог на русском языке.
 
 Основные возможности:
 
 - приём вызова через Asterisk ARI;
 - двусторонний звук через ExternalMedia + AudioSocket;
-- DTMF-меню и голосовые команды;
-- свободный диалог через LLM;
-- распознавание речи через AITUNNEL STT;
-- синтез ответов через AITUNNEL TTS;
-- запрос данных абонента из биллинга;
-- VAD, эндпоинтинг по тишине и DTMF barge-in;
+- два явных движка: `VOICE_PROVIDER=aitunnel` (по умолчанию) или `yandex_realtime`;
+- AITUNNEL: локальный VAD, STT, LLM и потоковый TTS 24 → 8 кГц;
+- Yandex Realtime: один WebSocket для серверного VAD, LLM и LiveTTS, PCM 8 → 16 → 8 кГц;
+- общие function calling-инструменты биллинга, перевода и завершения;
+- запрос разрешённых данных абонента из биллинга по названному голосом счёту;
+- эндпоинтинг по тишине, partial STT в AITUNNEL и голосовой barge-in;
 - запись входящего звука и JSON-метаданных вызова;
-- работа в деградированном режиме без STT/LLM — через WAV и DTMF.
+- WAV-заглушки для приветствия, ошибок и завершения.
 
-Основной сценарий сейчас выбирается через `SCENARIO_PATH`:
+Цифровое меню и DTMF-управление удалены. Все содержательные запросы обрабатываются в живом диалоге. Явная просьба оператора может быть быстрым голосовым переходом; остальная речь передаётся LLM.
 
-- `scenarios/default.json` — меню + LLM;
-- `scenarios/llm-first.json` — свободный диалог без озвученного меню.
+Основной сценарий — `scenarios/default.json`. `scenarios/llm-first.json` сохранён как совместимый вариант с тем же голосовым поведением и отдельным именем.
 
 ## 2. Цели и границы продукта
 
 ### 2.1. Цели
 
-1. Отвечать на типовые вопросы об интернете, тарифах, подключении и оплате.
+1. Отвечать на вопросы об интернете, тарифах, подключении и оплате.
 2. Проводить первичную диагностику проблем со связью.
 3. По названному абонентом лицевому счёту получать и озвучивать данные биллинга.
 4. Передавать сложные вопросы живому оператору.
 5. Завершать вызов по просьбе абонента или правилам сценария.
 6. Сохранять диагностическую информацию для разбора качества и ошибок.
 
-### 2.2. Текущие границы
+### 2.2. Границы
 
 Бот не должен самостоятельно:
 
@@ -55,28 +54,32 @@
 
 ### 2.3. Известные незавершённые функции
 
-Это **ограничения текущей реализации**, а не целевые требования:
+Это ограничения текущей реализации, а не целевые требования:
 
-1. Шаг `operator` проигрывает `operator.wav` и завершает вызов. Реального ARI-перевода на номер 508 пока нет.
-2. В `default.json` шаг DTMF «баланс» запрашивает биллинг, но выбирает статический WAV; актуальная сумма через этот шаг не озвучивается.
-3. В LLM-сценарии знание номера лицевого счёта является единственной проверкой перед запросом данных. Привязки счёта к подтверждённому звонящему или второго фактора нет.
-4. В JSON вызова может сохраняться полный `raw`-ответ биллинга. Для production необходимо заменить его строгим списком разрешённых полей.
-5. Нет RAG, PostgreSQL, docker-compose с тестовой АТС и эксплуатационных метрик.
-6. Нет полноценного jitter buffer для потокового TTS.
+1. Шаг `operator` проигрывает `operator.wav` и завершает вызов. Реального ARI-перевода на 508 пока нет.
+2. Знание номера лицевого счёта является единственной проверкой перед запросом данных. Привязки счёта к подтверждённому звонящему или второго фактора нет.
+3. В JSON вызова может сохраняться полный `raw`-ответ биллинга. Для production нужен строгий список разрешённых полей.
+4. Нет RAG, PostgreSQL, docker-compose с тестовой АТС и production-метрик.
+5. Нет полноценного jitter buffer для потокового TTS/Realtime.
+6. Без ключа выбранного провайдера живой диалог недоступен: AITUNNEL требует `AITUNNEL_API_KEY`, Realtime — `YANDEX_API_KEY` и `YANDEX_FOLDER_ID`.
+7. Реальное подключение Realtime проверено до `session.updated`, но живой телефонный вызов ещё не выполнен. Режим использует тот же номер 777, Stasis app `ivr_ai` и AudioSocket-порт 9092; перед переключением нужно остановить прежний процесс.
 
 ## 3. Технологический стек
 
 - Python `>=3.11`;
 - `asyncio` — сервер, задачи и таймауты;
-- `aiohttp>=3.9,<4` — ARI REST/WebSocket, биллинг, STT, TTS, LLM;
+- `aiohttp>=3.9,<4` — ARI, биллинг, AITUNNEL и Yandex Realtime WebSocket;
 - `numpy>=1.26,<3` — PCM, VAD и обработка сигнала;
 - `soxr>=1.0,<2` — качественный одноразовый и потоковый ресемплинг;
 - `python-dotenv>=1.0,<2` — загрузка `.env`;
-- `pytest` — тестирование, dev-зависимость;
+- `pytest` — dev-зависимость;
 - Asterisk 22.5.2, ARI, ExternalMedia, AudioSocket;
-- AITUNNEL OpenAI-совместимый API.
+- AITUNNEL OpenAI-совместимый API;
+- Yandex AI Studio Realtime `speech-realtime-max-tts-live/latest`, LiveTTS `sofia`.
 
-Проект рассчитан прежде всего на Windows/PowerShell, но основная логика использует кроссплатформенный Python.
+Новых Python-зависимостей для Realtime нет.
+
+Проект рассчитан прежде всего на Windows/PowerShell; основная логика использует кроссплатформенный Python.
 
 ## 4. Архитектура
 
@@ -85,24 +88,29 @@
    │ телефонный вызов на 777
    ▼
 Asterisk
-   │ StasisStart, DTMF, события каналов
+   │ StasisStart и события каналов
    │ WebSocket + HTTP ARI
    ▼
 AriEventStream ──► AriCallManager ──► PendingRegistry
                          │                  │
                          │ ExternalMedia    │ UUID → PendingCall
                          ▼                  ▼
-                   AudioSocketServer ──► CallSession
-                                            │
-                     ┌──────────────────────┼──────────────────────┐
-                     ▼                      ▼                      ▼
-               Dialog/Scenario       Speech STT/TTS          LLM conversation
-                     │                      │                      │
-                     ▼                      ▼                      ▼
-               WAV / TTS / DTMF       VAD + SoXR             VoiceTools
-                                                                  │
-                                                                  ▼
-                                                            BillingClient
+                   AudioSocketServer
+                          │
+              ┌───────────┴────────────┐
+              ▼                        ▼
+        CallSession             RealtimeCallSession
+        (AITUNNEL)              (Yandex Realtime)
+              │                        │
+       Scenario + VAD           постоянный WebSocket
+       STT → LLM → TTS          server VAD + LLM + LiveTTS
+              │                        │
+              └───────────┬────────────┘
+                          ▼
+                  VoiceTools + SoXR
+                          │
+                          ▼
+                    BillingClient
 ```
 
 ### 4.1. Ответственность модулей
@@ -114,10 +122,12 @@ AriEventStream ──► AriCallManager ──► PendingRegistry
 | `app/ari/client.py` | REST ARI |
 | `app/ari/events.py` | постоянный WebSocket и реконнект |
 | `app/ari/manager.py` | жизненный цикл ARI-вызова |
-| `app/audiosocket/protocol.py` | фреймы AudioSocket |
+| `app/audiosocket/protocol.py` | аудиофреймы, UUID, terminate и error |
 | `app/audiosocket/registry.py` | связь UUID с ожидающим вызовом |
-| `app/audiosocket/server.py` | TCP-сервер и набор активных сессий |
-| `app/audiosocket/session.py` | диалог, ввод, речь, LLM, запись и завершение |
+| `app/audiosocket/server.py` | TCP-сервер и явный выбор класса сессии по `VOICE_PROVIDER` |
+| `app/audiosocket/session.py` | AITUNNEL-диалог, общие ARI/запись/завершение |
+| `app/realtime/client.py` | WebSocket Yandex, session.update, PCM append и события |
+| `app/realtime/session.py` | Realtime-диалог, playback, barge-in, функции и метрики |
 | `app/audio/pcm.py` | WAV/PCM, SoXR, блоки и тишина |
 | `app/audio/playback.py` | воспроизведение с темпом 20 мс и остановка |
 | `app/audio/recorder.py` | инкрементальная запись WAV |
@@ -128,7 +138,7 @@ AriEventStream ──► AriCallManager ──► PendingRegistry
 
 ## 5. Жизненный цикл звонка через ARI
 
-### 5.1. Текущая интеграция
+### 5.1. Интеграция
 
 | Параметр | Значение |
 |---|---|
@@ -166,31 +176,21 @@ POST /channels/externalMedia
 9. Связать TCP с `PendingCall`, удалив его из pending registry.
 10. Добавить caller и media channel в bridge:
     `POST /bridges/{bridge}/addChannel?channel=caller,media`.
-11. Обрабатывать аудио и DTMF до завершения.
+11. Обрабатывать входящий PCM, вести голосовой диалог и отправлять PCM ответов.
 12. Удалить media channel, bridge и caller channel через ARI.
 
 ### 5.3. События
 
-Обрабатываются как минимум:
+Обрабатываются:
 
 - `StasisStart`;
-- `ChannelDtmfReceived`;
 - `StasisEnd`;
 - `ChannelHangupRequest`;
 - `ChannelDestroyed`.
 
-Для диагностики логируются также `ChannelStateChange`, `ChannelEnteredBridge`, `ChannelLeftBridge` и другие события жизненного цикла.
+Для диагностики логируются также `ChannelStateChange`, `ChannelEnteredBridge`, `ChannelLeftBridge` и другие события. События телефонных кнопок не влияют на диалог.
 
-### 5.4. DTMF без дублирования
-
-В ARI-режиме Asterisk может прислать одну цифру дважды:
-
-- событием `ChannelDtmfReceived`;
-- AudioSocket-фреймом `0x03`.
-
-Источник истины — ARI. AudioSocket DTMF в привязанной ARI-сессии игнорируется. В автономном режиме AudioSocket DTMF является единственным источником и обрабатывается.
-
-### 5.5. WebSocket реконнект
+### 5.4. WebSocket реконнект
 
 - heartbeat: 30 секунд;
 - экспоненциальная задержка переподключения: от 1 до 30 секунд;
@@ -206,7 +206,7 @@ POST /channels/externalMedia
 - TCP-сервер запущен на стороне бота;
 - Asterisk сам подключается к боту;
 - заголовок фрейма: 3 байта — тип `1 байт`, длина payload `2 байта big-endian`;
-- максимальный payload по протоколу: `65535` байт.
+- максимальный payload: `65535` байт.
 
 ### 6.2. Типы фреймов
 
@@ -214,17 +214,16 @@ POST /channels/externalMedia
 |---|---|
 | `0x00` | завершение |
 | `0x01` | UUID, ровно 16 бинарных байт |
-| `0x03` | один ASCII-символ DTMF |
 | `0x10` | PCM16 mono LE, 8 кГц |
 | `0x11`–`0x18` | PCM 12, 16, 24, 32, 44.1, 48, 96, 192 кГц |
 | `0xFF` | ошибка Asterisk |
 
-Допустимые DTMF: `0–9`, `*`, `#`, `A–D`.
+Прочие типы считаются неизвестными служебными фреймами, логируются на DEBUG и не участвуют в сценарии.
 
 ### 6.3. Привязка и отклонение соединений
 
 1. До UUID разрешено ждать `INIT_TIMEOUT`.
-2. Аудио и DTMF до UUID пропускаются.
+2. Аудио и служебные фреймы до UUID пропускаются.
 3. В ARI-режиме UUID должен находиться в `PendingRegistry`.
 4. Неизвестный UUID отклоняется при `ALLOW_UNKNOWN_SESSIONS=false`.
 5. В автономном режиме сессия может обслуживаться без `PendingCall`.
@@ -234,7 +233,7 @@ POST /channels/externalMedia
 
 - `INIT_TIMEOUT` — ожидание UUID;
 - `IDLE_TIMEOUT` — отсутствие входящих фреймов;
-- `MAX_CALL_SECONDS` — общая максимальная длительность диалога;
+- `MAX_CALL_SECONDS` — максимальная длительность диалога;
 - `EXTERNAL_MEDIA_TIMEOUT` — ожидание TCP после создания ExternalMedia.
 
 ## 7. Аудиотракт
@@ -269,7 +268,7 @@ mono
 
 ### 7.3. Ресемплинг
 
-Текущий стандарт проекта — **SoXR VHQ**.
+Текущий стандарт — **SoXR VHQ**.
 
 Для целого буфера использовать `soxr.resample(..., quality="VHQ")`.
 
@@ -280,7 +279,7 @@ mono
 - anti-alias-фильтр обязателен;
 - нельзя ресемплить каждые 20 мс независимо;
 - выход накапливается и нарезается на блоки 20 мс;
-- `flush()` вызывает `resample_chunk(..., last=True)` и возвращает задержанный фильтром остаток;
+- `flush()` вызывает `resample_chunk(..., last=True)` и возвращает задержанный остаток;
 - после `flush()` экземпляр не используется повторно.
 
 Приёмочные свойства:
@@ -294,7 +293,6 @@ mono
 
 - каждый блок отправляется с реальным темпом;
 - перед фразой добавляется `PLAYBACK_LEAD_IN_MS` тишины;
-- DTMF останавливает воспроизведение;
 - голосовой barge-in возможен только при выключенном echo guard;
 - при отставании плеер не отправляет накопленную пачку одним burst;
 - `stop()` досрочно завершает текущий промпт/TTS.
@@ -306,13 +304,13 @@ mono
 ```json
 {
   "name": "default",
-  "description": "Описание",
+  "description": "Свободный голосовой диалог",
   "initial": "greeting",
   "steps": {
     "greeting": {
       "label": "приветствие",
       "prompt": "greeting.wav",
-      "next": "menu"
+      "next": "dialog"
     }
   }
 }
@@ -326,29 +324,28 @@ mono
 | `prompt` | аудиофайл относительно `PROMPTS_DIR` |
 | `text` | TTS-текст, если WAV недоступен |
 | `next` | следующий шаг без ожидания ввода |
-| `dtmf` | объект `цифра → шаг` |
 | `voice` | объект `фраза → шаг` |
 | `llm` | свободный диалог через LLM |
-| `timeout_ms` | ожидание ввода, по умолчанию 8000 |
+| `timeout_ms` | ожидание реплики, по умолчанию 8000 |
 | `max_attempts` | попытки, по умолчанию 2, минимум 1 |
-| `on_invalid` | переход после неверного ввода |
+| `on_invalid` | переход после нераспознанной голосовой команды |
 | `on_timeout` | переход после тишины |
 | `hangup` | завершить после шага |
-| `billing` | `caller` или конкретный userId |
+| `billing` | расширение движка: `caller` или конкретный userId; в основном сценарии не используется |
 | `prompt_not_found` | WAV, если абонент не найден |
 | `prompt_error` | WAV, если биллинг недоступен |
 
-При загрузке проверяются типы, DTMF, неотрицательный timeout, число попыток и существование всех переходов.
+При загрузке проверяются типы, неотрицательный timeout, число попыток и существование переходов. Поле `dtmf` явно отклоняется с ошибкой, чтобы старое меню не было проигнорировано без предупреждения.
 
-### 8.3. Обычный шаг
+### 8.3. Обычный голосовой шаг
 
-1. При наличии `billing` сначала выполнить запрос и выбрать prompt.
+1. При наличии `billing` выполнить запрос и выбрать prompt.
 2. Проиграть WAV или TTS.
 3. Если `hangup=true`, завершить.
-4. Если нет `dtmf` и `voice`, перейти по `next`.
-5. Иначе ждать ввод `timeout_ms`.
-6. Совпадение → перейти по карте.
-7. Неверный ввод или тишина → повторить шаг.
+4. Если нет `voice`, перейти по `next`.
+5. Иначе ждать распознанную фразу `timeout_ms`.
+6. Совпадение → перейти по карте `voice`.
+7. Незнакомая фраза или тишина → повторить шаг.
 8. После исчерпания попыток использовать `on_invalid`/`on_timeout`; при отсутствии перехода завершить диалог.
 
 ### 8.4. Голосовые команды
@@ -360,52 +357,23 @@ mono
 - знаки препинания заменяются пробелами;
 - повторные пробелы удаляются.
 
-Сначала ищутся фразы из `voice`, более длинные имеют приоритет. Затем распознаются числительные и одиночные цифры: «ноль», «нуль», «один», «раз», «два», «две», «три» и т. д. Они сопоставляются с `dtmf` текущего шага.
+Фразы из `voice` ищутся в распознанном тексте; более длинные имеют приоритет. Числительные не преобразуются в команды меню.
 
-### 8.5. `default.json`
+### 8.5. `default.json` и `llm-first.json`
 
-| Шаг | Поведение |
-|---|---|
-| `greeting` | greeting.wav → menu |
-| `menu` | LLM, ожидание 8 с, 2 попытки |
-| `menu_repeat` | повтор menu.wav → menu |
-| `invalid_digit` | invalid_digit.wav → menu |
-| `no_input` | no_input.wav → menu |
-| `balance` | billing=caller, выбор одного из трёх WAV → menu |
-| `tech_support` | tech_support.wav → menu |
-| `payment` | payment.wav → menu |
-| `operator` | operator.wav → hangup |
-| `fallback` | fallback.wav → hangup |
-
-DTMF меню:
-
-- `1` → balance;
-- `2` → tech_support;
-- `3` → payment;
-- `9` → menu_repeat;
-- `0` → operator.
-
-Голосовые фразы включают «баланс», «проверить баланс», «техподдержка», «интернет не работает», «оплата», «оператор», «повторите меню» и перечисленные в JSON синонимы.
-
-### 8.6. `llm-first.json`
+Оба файла описывают один и тот же путь:
 
 | Шаг | Поведение |
 |---|---|
 | `greeting` | greeting.wav → dialog |
-| `dialog` | dialog.wav или «Чем я могу помочь?», затем LLM |
+| `dialog` | dialog.wav или «Чем я могу помочь?», затем свободный LLM-диалог |
 | `no_input` | no_input.wav → fallback |
-| `tech_support` | tech_support.wav → dialog |
-| `payment` | payment.wav → dialog |
 | `operator` | operator.wav → hangup |
 | `fallback` | fallback.wav → hangup |
 
-Скрытые DTMF:
+Параметры `dialog`: ожидание 8 с, 2 попытки, голосовые переходы «оператор» и «соедините с оператором», `on_invalid=no_input`, `on_timeout=no_input`.
 
-- `2` → tech_support;
-- `3` → payment;
-- `0` → operator.
-
-Голосовой быстрый переход предусмотрен только для явной просьбы оператора. Баланс запрашивается через LLM-инструмент по названному счёту, а не через `caller`.
+Баланс запрашивается через LLM-инструмент по названному счёту, а не через caller. Статических шагов меню, оплаты, техподдержки и баланса в основном сценарии нет.
 
 ## 9. STT, VAD и входная речь
 
@@ -435,8 +403,6 @@ Content-Type: multipart/form-data
 ### 9.2. VAD
 
 Алгоритм — RMS по 20-мс кадрам с адаптивной шумовой дорожкой.
-
-Параметры:
 
 | Параметр | По умолчанию |
 |---|---:|
@@ -474,8 +440,7 @@ max(VAD_RMS_THRESHOLD, noise_floor * VAD_NOISE_MULTIPLIER)
 - окно проверки — 6 секунд;
 - минимальная нормализованная длина — 8 символов без пробелов;
 - порог похожести `SequenceMatcher` — 0.72;
-- голосовой barge-in во время речи бота фактически отключён;
-- DTMF barge-in продолжает работать.
+- голосовой barge-in во время речи бота фактически отключён.
 
 При `VOICE_ECHO_GUARD=false` и `VOICE_BARGE_IN=true` начало речи останавливает WAV/TTS.
 
@@ -510,7 +475,7 @@ Content-Type: application/json
 4. После конца HTTP-потока вызвать `flush()`.
 5. Для WAV прочитать ответ, проверить PCM16 mono и ресемплить при необходимости.
 
-Ошибка TTS логируется и увеличивает `speech_errors`, но не должна неожиданно ронять весь сервер.
+Ошибка TTS логируется и увеличивает `speech_errors`, но не должна неожиданно ронять сервер.
 
 ## 11. LLM и function calling
 
@@ -542,7 +507,7 @@ LLM-текст не стримится: сначала получается по
 4. `internet_private.md` — тарифы и адреса;
 5. `TOOL_GUIDE` — правила вызова инструментов.
 
-Все доступные справочники сейчас передаются целиком в system-сообщение при каждом запросе.
+Все доступные справочники передаются целиком в system-сообщение при каждом запросе.
 
 Основные правила модели:
 
@@ -578,8 +543,9 @@ LLM-текст не стримится: сначала получается по
 
 - устанавливает `control.transfer=true`;
 - возвращает номер 508;
-- сессия переходит на шаг `operator`, если он существует;
-- текущее ограничение: реального телефонного перевода этот переход не выполняет.
+- AITUNNEL переходит на шаг `operator`, если он существует;
+- Realtime завершает вызов после текущего сообщения с причиной `realtime_transfer`;
+- текущее ограничение: реального телефонного перевода оба перехода не выполняют.
 
 #### `end_call()`
 
@@ -590,14 +556,7 @@ LLM-текст не стримится: сначала получается по
 
 ### 11.5. Обработка ответа
 
-Перед TTS удаляются:
-
-- fenced code;
-- markdown-заголовки;
-- markdown-ссылки с сохранением текста;
-- маркеры списков;
-- символы выделения;
-- лишние пробелы.
+Перед TTS удаляются fenced code, markdown-заголовки, ссылки с сохранением текста, маркеры списков, символы выделения и лишние пробелы.
 
 Если текст пуст:
 
@@ -605,7 +564,102 @@ LLM-текст не стримится: сначала получается по
 - transfer → «Перевожу вас на оператора.»;
 - иначе → просьба повторить.
 
-При ошибке LLM бот говорит о технической ошибке и переходит к оператору или fallback сценария.
+При ошибке AITUNNEL LLM бот говорит о технической ошибке и переходит к оператору или fallback сценария.
+
+### 11.6. Yandex Realtime
+
+Это отдельный путь, а не реализация старых `SpeechBackend`/`LLMBackend`: локальные VAD, STT, LLM и TTS не создаются. На каждый вызов создаются `RealtimeCallSession` и собственный WebSocket. Наследование от `CallSession` сохраняет AudioSocket, запись WAV, sidecar, max-call timeout и ARI-очистку.
+
+Подключение:
+
+```text
+wss://ai.api.cloud.yandex.net/v1/realtime/openai?model=gpt://<YANDEX_FOLDER_ID>/speech-realtime-max-tts-live/latest
+Authorization: Api-Key <YANDEX_API_KEY>
+x-data-logging-enabled: false
+model URI: gpt://<YANDEX_FOLDER_ID>/speech-realtime-max-tts-live/latest
+```
+
+`YANDEX_DATA_LOGGING=true` меняет последний заголовок на `true`; по умолчанию логирование содержимого у провайдера выключено. После подключения отправляется `session.update`:
+
+```json
+{
+  "type": "session.update",
+  "session": {
+    "type": "realtime",
+    "model": "gpt://<folder>/speech-realtime-max-tts-live/latest",
+    "instructions": "<собранный LLMPromptSet.system>",
+    "output_modalities": ["audio"],
+    "audio": {
+      "input": {
+        "format": {"type": "audio/pcm", "rate": 16000},
+        "turn_detection": {
+          "type": "server_vad",
+          "threshold": 0.5,
+          "silence_duration_ms": 700
+        }
+      },
+      "output": {
+        "format": {"type": "audio/pcm", "rate": 16000},
+        "voice": "sofia"
+      }
+    },
+    "tools": [
+      {
+        "type": "function",
+        "name": "get_billing_info",
+        "description": "...",
+        "parameters": {"type": "object"}
+      }
+    ]
+  }
+}
+```
+
+Все три схемы `VoiceTools` преобразуются из вложенного OpenAI-формата `{type, function: {...}}` в плоский `{type, name, description, parameters}`.
+
+Входной тракт:
+
+1. `_on_audio` продолжает писать исходный PCM 8 кГц в WAV и передаёт его `_feed_voice`.
+2. Отдельная async-задача использует один `PcmStreamResampler(8000, 16000)` на весь звонок.
+3. Каждый готовый блок отправляется как `input_audio_buffer.append` с base64 PCM16 mono 16 кГц.
+4. При `server_vad` событие `input_audio_buffer.commit` не отправляется.
+5. При `VOICE_ECHO_GUARD=true` входной звук не передаётся во время речи бота и 500 мс после неё; похожие на недавние реплики бота расшифровки отбрасываются. Голосовой barge-in в этом режиме отключён. При `false` вход идёт непрерывно и `speech_started` может перебить ответ, включая ложное срабатывание от эха.
+
+После настройки `response.create` просит модель кратко поприветствовать от имени поддержки «Евпанет» и спросить, чем помочь. WAV-приветствие сценария не используется.
+
+Обрабатываемые события:
+
+| Событие | Действие |
+|---|---|
+| `input_audio_buffer.speech_started` | при выключенном echo guard остановить AudioPlayer, очистить аудиоочередь, отбросить поздние дельты старого response |
+| `input_audio_buffer.speech_stopped` | сохранить monotonic timestamp для задержки |
+| `conversation.item.input_audio_transcription.completed` | отбросить похожее на реплику бота эхо либо добавить transcript и увеличить `llm_turns` |
+| `response.created` | создать очередь, SoXR 16 → 8 кГц и playback task |
+| `response.output_audio.delta` | декодировать base64, потоково ресемплить и сразу ставить в playback |
+| `response.output_audio.done` | вызвать `flush()` у resampler текущего response |
+| `response.output_audio_transcript.done` | сохранить текст ответа и число символов |
+| `response.output_item.done` с `function_call` | запомнить вызов до `response.done` |
+| `response.done` | накопить `response.usage`, завершить очередь аудио и запустить финализатор |
+| `error` | залогировать, увеличить `llm_errors`, корректно завершить вызов |
+
+Playback task один на response, добавляет `PLAYBACK_LEAD_IN_MS` и использует тот же paced `AudioPlayer`. Для `function_call` финализатор сначала ждёт окончания/перебивания текущего аудио, затем вызывает общий `VoiceTools.execute`, отправляет:
+
+```json
+{
+  "type": "conversation.item.create",
+  "item": {
+    "type": "function_call_output",
+    "call_id": "<call_id>",
+    "output": "<JSON-строка>"
+  }
+}
+```
+
+Для биллинга затем отправляется `{"type":"response.create"}`. После успешного `get_billing_info` устанавливается ожидание голосового ответа: если следующий function-only ответ вызывает `transfer_to_operator`, выполнение перевода блокируется, функция получает `billing_answer_required`, затем запрашивается новый ответ. После `response.output_audio_transcript.done` ограничение снимается. При разрешённых `end_call`/`transfer_to_operator` новый ответ не запрашивается: вызов завершается после уже полученного прощания/сообщения с причиной `realtime_end_call`/`realtime_transfer`. Реального перевода на 508 по-прежнему нет.
+
+При shutdown отменяются input/event/finalizer/playback tasks, закрываются WebSocket и HTTP-сессия, затем выполняется общая очистка `CallSession`. Обрыв AudioSocket или `abort()` пробуждает Realtime-диалог и не оставляет ожидание WebSocket навсегда.
+
+Переключение движка не меняет телефонную интеграцию: оба режима используют номер 777, `ARI_APP=ivr_ai`, `AUDIOSOCKET_PORT=9092`, `EXTERNAL_MEDIA_PORT=9092` и тот же `EXTERNAL_MEDIA_HOST`. Для Yandex остановить процесс AITUNNEL и запустить `python -m app --voice-provider yandex_realtime` с тем же `.env`; для возврата использовать `--voice-provider aitunnel`. Одновременный запуск двух процессов с одним портом/Stasis app не допускается. Отдельный номер, приложение Asterisk и порт не требуются.
 
 ## 12. Биллинг
 
@@ -617,8 +671,10 @@ Authorization: Bearer <BILLING_TOKEN>
 Content-Type: application/json
 Accept: application/json
 
-{"userId": "<лицевой счёт или номер>"}
+{"userId": "<лицевой счёт>"}
 ```
+
+В основном сценарии счёт берётся только из речи абонента и передаётся через LLM-инструмент. Поиск по caller в живом диалоге не используется.
 
 ### 12.2. Ответ
 
@@ -650,7 +706,7 @@ Accept: application/json
 {"found": false, "user": null}
 ```
 
-HTTP 400 и другие HTTP >=400, сетевые ошибки, таймаут и не-JSON считаются `BillingError`.
+HTTP >=400, сетевые ошибки, таймаут и не-JSON считаются `BillingError`.
 
 ### 12.3. Нормализованная модель
 
@@ -733,8 +789,6 @@ HTTP 400 и другие HTTP >=400, сетевые ошибки, таймаут
 
 ### 13.5. «Сезонный»
 
-Дополнительный тариф для временного сохранения подключения:
-
 - многоквартирный дом — 1000 ₽/мес;
 - частный сектор — 1500 ₽/мес;
 - предприниматели и нежилые помещения — 2500 ₽/мес.
@@ -764,7 +818,7 @@ RECORDINGS_DIR/<uuid>.json
 
 WAV содержит только входящий звук абонента после приведения к 8 кГц. Запись инкрементальная; файл сбрасывается на диск после каждого фрейма.
 
-Текущее поведение: если WAV не открыт или запись отключена, JSON также не создаётся. Для production рекомендуется разделить запись аудио и запись метаданных.
+Текущее поведение: если WAV не открыт или запись отключена, JSON также не создаётся. Для production рекомендуется разделить запись аудио и метаданных.
 
 ### 14.2. Поля JSON
 
@@ -773,37 +827,59 @@ WAV содержит только входящий звук абонента п�
   "session_id": "uuid",
   "channel_id": "ARI channel",
   "caller": "номер или null",
-  "scenario": "llm-first",
+  "scenario": "default",
   "peer": "IP:port",
   "started_at": "UTC ISO-8601",
   "duration_seconds": 24.7,
   "audio_frames": 1000,
   "audio_seconds": 20.0,
-  "dtmf": "0",
   "steps": ["greeting", "dialog"],
-  "transcripts": ["текст"],
+  "transcripts": ["Какой у меня баланс?"],
   "partial_transcripts": ["частичный текст"],
   "barge_ins": 0,
   "ignored_echo": 0,
   "tts_characters": 100,
   "speech_errors": 0,
   "llm_turns": 1,
-  "llm_tool_calls": 0,
+  "llm_tool_calls": 1,
   "llm_errors": 0,
   "llm_replies": ["ответ"],
-  "hangup_reason": "dialog_end",
+  "hangup_reason": "llm_end_call",
   "billing": null,
-  "recording": "uuid.wav"
+  "recording": "uuid.wav",
+  "voice_provider": "yandex_realtime",
+  "realtime_model": "speech-realtime-max-tts-live/latest",
+  "realtime_system_prompt_characters": 19627,
+  "realtime_input_audio_seconds": 12.5,
+  "realtime_output_audio_seconds": 4.2,
+  "realtime_usage": {
+    "responses": 1,
+    "total_tokens": 1200,
+    "input_tokens": 1000,
+    "input_text_tokens": 700,
+    "input_audio_tokens": 250,
+    "cached_input_tokens": 600,
+    "cached_input_text_tokens": 550,
+    "cached_input_audio_tokens": 50,
+    "uncached_input_tokens": 400,
+    "tool_tokens": 50,
+    "output_tokens": 200,
+    "output_text_tokens": 20,
+    "output_audio_tokens": 180
+  },
+  "realtime_first_audio_latency_ms": [510.0]
 }
 ```
 
-Типовые причины завершения: `hangup_step`, `dialog_end`, `llm_end_call`, `llm_transfer`, `terminated`, `peer_closed`, `idle_timeout`, `max_duration`, `asterisk_error`, `connection_error`, `cancelled`, `error`.
+`voice_provider` записывается в обоих режимах. Остальные `realtime_*` поля добавляются только в Realtime. Секунды входа/выхода вычисляются по фактически переданному PCM 16 кГц до ресемплинга; токены суммируются из `response.usage` всех `response.done`. Кешированные токены являются подмножеством входных, `uncached_input_tokens` — разница между ними. `responses=0` означает, что провайдер не прислал usage. Денежные тарифы и автоматический расчёт рублей в sidecar не хранятся.
+
+Типовые причины завершения: `hangup_step`, `dialog_end`, `llm_end_call`, `llm_transfer`, `realtime_end_call`, `realtime_transfer`, `realtime_error`, `realtime_input_error`, `terminated`, `peer_closed`, `idle_timeout`, `max_duration`, `asterisk_error`, `connection_error`, `cancelled`, `error`.
 
 Данные являются чувствительными: необходимо ограничить доступ, установить срок хранения и удаление.
 
 ## 15. Конфигурация
 
-Все пути относительно корня проекта, если не задан абсолютный путь. `ENV_FILE` или `--env-file` позволяет выбрать другой файл. Реальные секреты не коммитить.
+Все пути относительно корня проекта, если не задан абсолютный путь. `ENV_FILE` или `--env-file` выбирает другой файл. Реальные секреты не коммитить.
 
 | Переменная | По умолчанию | Назначение |
 |---|---|---|
@@ -820,7 +896,7 @@ WAV содержит только входящий звук абонента п�
 | `EXTERNAL_MEDIA_ENCAPSULATION` | `audiosocket` | encapsulation |
 | `EXTERNAL_MEDIA_TIMEOUT` | `5` | ожидание TCP, с |
 | `ALLOW_UNKNOWN_SESSIONS` | см. примечание | принимать неизвестные UUID |
-| `SCENARIO_PATH` | `scenarios/default.json` | сценарий |
+| `SCENARIO_PATH` | `scenarios/default.json` | живой голосовой сценарий |
 | `PROMPTS_DIR` | `prompts/placeholder` | WAV-промпты |
 | `RECORDINGS_DIR` | `recordings` | записи |
 | `RECORD_CALLS` | `true` | запись WAV |
@@ -831,6 +907,14 @@ WAV содержит только входящий звук абонента п�
 | `BILLING_TOKEN` | нет | Bearer token |
 | `BILLING_TIMEOUT` | `10` | timeout, с |
 | `BILLING_MOCK` | `false` | тестовый биллинг |
+| `VOICE_PROVIDER` | `aitunnel` | `aitunnel` или `yandex_realtime`; другое значение — ValueError |
+| `YANDEX_API_KEY` | нет | Api-Key, маскируется в логах |
+| `YANDEX_FOLDER_ID` | нет | folder для model URI |
+| `YANDEX_REALTIME_URL` | `wss://ai.api.cloud.yandex.net/v1/realtime/openai` | WebSocket |
+| `YANDEX_REALTIME_MODEL` | `speech-realtime-max-tts-live/latest` | модель LiveTTS |
+| `YANDEX_REALTIME_VOICE` | `sofia` | голос |
+| `YANDEX_REALTIME_TIMEOUT` | `10` | connect timeout, с |
+| `YANDEX_DATA_LOGGING` | `false` | заголовок логирования содержимого |
 | `AITUNNEL_API_KEY` | нет | единый ключ STT/TTS/LLM |
 | `AITUNNEL_BASE_URL` | `https://api.aitunnel.ru/v1` | API base URL |
 | `STT_MODEL` | `whisper-large-v3-turbo` | STT model |
@@ -841,7 +925,7 @@ WAV содержит только входящий звук абонента п�
 | `TTS_FORMAT` | `pcm` | `pcm` или `wav` |
 | `TTS_PCM_RATE` | `24000` | частота исходного PCM |
 | `VOICE_INPUT` | `true` | VAD/STT |
-| `VOICE_BARGE_IN` | `true` | разрешить голосовое прерывание |
+| `VOICE_BARGE_IN` | `true` | голосовое прерывание |
 | `VOICE_ECHO_GUARD` | `true` | защита от эха |
 | `PLAYBACK_LEAD_IN_MS` | `150` | тишина перед фразой |
 | `VAD_START_MS` | `160` | начало речи |
@@ -859,13 +943,11 @@ WAV содержит только входящий звук абонента п�
 | `LLM_HISTORY_MESSAGES` | `40` | история |
 | `LOG_LEVEL` | `INFO` | логирование |
 
-**Примечание о несоответствии:** в `Settings.from_env()` `ALLOW_UNKNOWN_SESSIONS` по умолчанию `True`, а в `.env.example` установлено `false`. Для ARI/production следует явно задавать `false`; при воссоздании лучше сразу исправить кодовый default на fail-closed.
+**Несоответствие:** в `Settings.from_env()` `ALLOW_UNKNOWN_SESSIONS` по умолчанию `True`, а в `.env.example` установлено `false`. Для ARI/production следует явно задавать `false`; при воссоздании лучше сразу исправить кодовый default на fail-closed.
 
-ARI включается автоматически только при полном наборе `ARI_URL`, `ARI_USER`, `ARI_PASSWORD`, `ARI_APP`. Биллинг включён при URL + token или mock. STT/TTS/LLM требуют API-ключ.
+ARI включается автоматически только при полном наборе `ARI_URL`, `ARI_USER`, `ARI_PASSWORD`, `ARI_APP`. Биллинг включён при URL + token или mock. В AITUNNEL STT/TTS/LLM требуют `AITUNNEL_API_KEY`; в Realtime при старте обязательны `YANDEX_API_KEY` и `YANDEX_FOLDER_ID`, иначе CLI завершается кодом 2. В Realtime AITUNNEL-клиенты не создаются и их ключ не нужен. `VAD_SILENCE_MS` задаёт серверную тишину, а остальные локальные VAD/partial-настройки относятся только к AITUNNEL.
 
 ## 16. CLI и диагностика
-
-Запуск из корня проекта:
 
 ```powershell
 python -m app
@@ -878,12 +960,14 @@ python -m app --billing-check 1 --billing-mock
 python -m app --tts-check "Проверка синтеза речи"
 python -m app --stt-check recordings/example.wav
 python -m app --llm-check "Какие тарифы в Евпатории?"
+python -m app --voice-provider yandex_realtime --check
+python -m app --env-file .env.yandex
 ```
 
 Дополнительные параметры:
 
 - `--env-file PATH`;
-- `--host`, `--port`;
+- `--host`, `--port`, `--voice-provider aitunnel|yandex_realtime`;
 - `--scenario`, `--prompts-dir`, `--llm-prompts-dir`;
 - `--recordings-dir`;
 - `--record` / `--no-record`;
@@ -898,10 +982,15 @@ python -m app --llm-check "Какие тарифы в Евпатории?"
 
 ```powershell
 python tools/make_placeholder_prompts.py
-python tools/simulate_call.py --digits 0 --save recordings/prompts.wav
+python tools/simulate_call.py --input recordings/caller.wav --save recordings/reply.wav
 python tools/check_external_media.py --host <внешний-адрес> --port 9092
+python tools/check_realtime.py --env-file .env.yandex
 python tools/save_tts_comparison.py "Здравствуйте! Проверка качества речи."
 ```
+
+Симулятор передаёт WAV блоками 20 мс, добавляет `--tail-ms` тишины (по умолчанию 1000) для эндпоинтинга и слушает ответ. `--delay` задаёт паузу перед репликой.
+
+`check_realtime.py` принудительно выбирает Yandex Realtime, загружает ключи из выбранного env-файла, подключается, отправляет `session.update` и ждёт `session.updated`. Секреты не печатаются; ошибки API показываются с описанием. Модель передаётся в обязательном query-параметре `model` и дублируется в session.
 
 `save_tts_comparison.py` делает один TTS-запрос и сохраняет:
 
@@ -922,6 +1011,9 @@ app/
   billing/
   dialog/
   llm/
+  realtime/
+    client.py
+    session.py
   speech/
 asterisk/
   README.md
@@ -939,6 +1031,7 @@ scenarios/
 tests/
 tools/
   check_external_media.py
+  check_realtime.py
   make_placeholder_prompts.py
   save_tts_comparison.py
   simulate_call.py
@@ -950,7 +1043,7 @@ README.md
 PROJECT_SPEC.md
 ```
 
-Не коммитить `.env`, `recordings/`, `.venv/`, pytest cache и реальные секретные заметки.
+Не коммитить `.env`, `.env.*` (кроме `.env.example`), `recordings/`, `.venv`, pytest cache и реальные секретные заметки.
 
 ## 18. Ошибки и завершение
 
@@ -958,8 +1051,8 @@ PROJECT_SPEC.md
 
 - ошибка одной сессии не должна ронять сервер;
 - ошибка STT, TTS или LLM не должна оставлять необработанную фоновую задачу;
-- при завершении отменять read/STT tasks;
-- закрывать recorder и writer;
+- при завершении отменять read/STT либо Realtime input/event/finalizer/playback tasks;
+- закрывать recorder, writer, Realtime WebSocket и HTTP-сессию;
 - отправлять AudioSocket terminate, если соединение ещё открыто;
 - очищать pending registry, media channel, bridge и caller;
 - останавливать ARI events и HTTP-сессии при shutdown;
@@ -990,8 +1083,6 @@ PROJECT_SPEC.md
 
 ## 20. Тестирование и критерии приёмки
 
-Текущий набор: **127 тестов**.
-
 Запуск:
 
 ```powershell
@@ -1000,18 +1091,20 @@ python -m pytest
 
 Обязательные группы:
 
-- AudioSocket protocol, UUID, DTMF, неполные фреймы;
+- AudioSocket protocol, UUID, неполные фреймы и неизвестные типы;
 - PCM/WAV, arbitrary chunks, SoXR streaming, anti-alias;
 - темп воспроизведения и stop;
-- сценарии, ссылки, неверные поля, timeout/fallback;
-- голосовые интенты и числительные;
+- сценарии, голосовые ссылки, неверные поля, timeout/fallback;
+- голосовые интенты без числового меню;
 - ARI REST, auth, reconnect, полный вызов и очистка;
 - unknown UUID;
 - биллинг: found/not found, 400/5xx, не-JSON, mock;
 - VAD, pre-roll, partial STT, barge-in, echo guard;
 - STT/TTS fake server, multipart и поток;
 - LLM tools, история, лимит раундов, ошибки;
-- LLM-first и fallback без API-ключа.
+- Realtime: env/masking, WS URL/headers/session.update, flat tools, 8 ↔ 16 кГц, transcripts, latency, billing output, end/transfer после audio, barge-in и cleanup;
+- выбор `RealtimeCallSession` только при явном `yandex_realtime`;
+- живой диалог и fallback при отсутствии LLM-ключа или тишине.
 
 ### 20.1. Минимальная приёмка воссозданного проекта
 
@@ -1019,14 +1112,15 @@ python -m pytest
 2. Все автоматические тесты проходят.
 3. Сквозной fake-ARI вызов доходит от `StasisStart` до очистки.
 4. Неизвестный UUID отклоняется в ARI-режиме.
-5. DTMF не обрабатывается дважды.
+5. Телефонные кнопки не вызывают сценарных переходов.
 6. Обрыв TCP не останавливает сервер.
 7. TTS 24 кГц потоково преобразуется в 8 кГц без независимых границ фильтра.
 8. Исходный и обработанный TTS можно сохранить и прослушать.
-9. Без AITUNNEL-ключа остаются WAV и DTMF.
+9. Свободная реплика проходит STT → LLM → TTS и сохраняется в метаданных.
 10. Ошибки биллинга и LLM приводят к предсказуемому fallback.
 11. Секреты не появляются в логах и репозитории.
 12. Реальный звонок на 777 имеет двусторонний звук и корректно завершается.
+13. Для Realtime моки подтверждают протокол, аудио, функции, barge-in и отсутствие зависших задач; отдельный живой звонок остаётся обязательным перед эксплуатацией.
 
 ### 20.2. Отдельная production-приёмка
 
@@ -1034,7 +1128,6 @@ python -m pytest
 
 - оператор реально получает вызов;
 - занято/нет ответа оператора обрабатывается;
-- баланс озвучивается по актуальным данным;
 - доступ к чужому счёту невозможен;
 - raw billing не сохраняется;
 - записи автоматически удаляются по политике;
@@ -1076,21 +1169,21 @@ python tools/check_external_media.py --host <внешний-адрес> --port 9
 ```
 
 12. Проверить STT/TTS/LLM диагностическими командами.
-13. Выполнить тестовый звонок, проверить запись, метаданные и очистку ARI.
-14. До production закрыть пункты раздела 20.2.
+13. Выполнить тестовый звонок, проверить живой диалог, запись, метаданные и очистку ARI.
+14. Для Realtime заполнить Yandex key/folder в том же `.env`, остановить AITUNNEL и запустить `python -m app --voice-provider yandex_realtime`; сохранить `ivr_ai`, 9092 и номер 777.
+15. До production закрыть пункты раздела 20.2.
 
 ## 22. Рекомендуемый порядок развития
 
 1. Реальный перевод оператору и обработка занято/нет ответа.
-2. Содержательная озвучка баланса в DTMF-сценарии.
-3. Авторизация доступа к данным счёта.
-4. Минимизация биллинга и ПДн в JSON/логах, retention.
-5. Надёжность ARI event loop, startup/shutdown и лимиты соединений.
-6. Буфер воспроизведения TTS и метрики задержек/underrun.
-7. CI, Ruff, типизация, lock-файл зависимостей.
-8. Декомпозиция `CallSession`.
-9. Выбор справочников по намерению; RAG только при росте базы знаний.
-10. PostgreSQL и контейнеризованная тестовая АТС по фактической потребности.
+2. Авторизация доступа к данным счёта.
+3. Минимизация биллинга и ПДн в JSON/логах, retention.
+4. Надёжность ARI event loop, startup/shutdown и лимиты соединений.
+5. Буфер воспроизведения TTS и метрики задержек/underrun.
+6. CI, Ruff, типизация, lock-файл зависимостей.
+7. Декомпозиция `CallSession`.
+8. Выбор справочников по намерению; RAG только при росте базы знаний.
+9. PostgreSQL и контейнеризованная тестовая АТС по фактической потребности.
 
 ---
 

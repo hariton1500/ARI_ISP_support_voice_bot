@@ -53,16 +53,7 @@ def scenario(tmp_path: Path) -> Scenario:
         "initial": "greeting",
         "steps": {
             "greeting": {"prompt": "greeting.wav", "next": "menu"},
-            "menu": {
-                "prompt": "menu.wav",
-                "timeout_ms": 400,
-                "max_attempts": 2,
-                "dtmf": {"1": "balance", "0": "operator"},
-                "on_invalid": "invalid",
-                "on_timeout": "fallback",
-            },
-            "balance": {"prompt": "balance.wav", "next": "menu"},
-            "invalid": {"prompt": "invalid.wav", "next": "menu"},
+            "menu": {"prompt": "menu.wav", "next": "operator"},
             "operator": {"prompt": "operator.wav", "hangup": True},
             "fallback": {"prompt": "fallback.wav", "hangup": True},
         },

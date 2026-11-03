@@ -1,5 +1,7 @@
 # Секреты
 .env
+.env.*
+!.env.example
 # В этом файле рекомендации Asterisk с паролем ARI в открытом виде
 ari-ivr_ai.md
 

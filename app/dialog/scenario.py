@@ -1,12 +1,11 @@
-"""Модель сценария диалога.
+"""Модель сценария голосового диалога.
 
 Сценарий — это JSON-файл с именованными шагами. Шаг умеет:
   * проиграть промпт (`prompt` — имя файла относительно PROMPTS_DIR);
   * озвучить `text` через AITUNNEL TTS, если WAV-промпта нет;
-  * принять DTMF-цифру и перейти на другой шаг (`dtmf`);
-  * принять распознанную фразу (`voice`: фраза -> шаг) или числительное;
+  * принять распознанную фразу (`voice`: фраза -> шаг);
   * вести свободный диалог через LLM (`llm`: true), если фраза не совпала
-    с `voice`/DTMF;
+    с `voice`;
   * перейти на шаг без ожидания ввода (`next`);
   * обработать отсутствие ввода (`on_timeout`) и неверный ввод (`on_invalid`);
   * завершить вызов (`hangup`);
@@ -15,7 +14,7 @@
     (`prompt_not_found` / `prompt_error`).
 
 Логика обработки ввода:
-  1. цифра есть в `dtmf` или фраза есть в `voice` — переход по карте;
+  1. фраза есть в `voice` — переход по карте;
   2. ввода нет за `timeout_ms` или он не распознан — счётчик попыток растёт,
      шаг повторяется (промпт играется заново);
   3. после `max_attempts` попыток — переход на `on_invalid` (неверный ввод)
@@ -33,7 +32,6 @@ from typing import Any, Mapping
 
 DEFAULT_TIMEOUT_MS = 8000
 DEFAULT_MAX_ATTEMPTS = 2
-DTMF_ALPHABET = frozenset("0123456789*#ABCD")
 
 
 class ScenarioError(ValueError):
@@ -48,7 +46,6 @@ class Step:
     label: str
     prompt: str | None
     next: str | None
-    dtmf: Mapping[str, str]
     on_timeout: str | None
     on_invalid: str | None
     timeout_ms: int
@@ -64,7 +61,7 @@ class Step:
     text: str | None = None
     #: Голосовые команды: нормализованная фраза -> имя шага.
     voice: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
-    #: Свободный диалог через LLM после промпта. DTMF и `voice` имеют приоритет,
+    #: Свободный диалог через LLM после промпта. `voice` имеет приоритет,
     #: остальные распознанные фразы уходят модели.
     llm: bool = False
 
@@ -148,7 +145,6 @@ class Scenario:
                 targets.append(("on_timeout", step.on_timeout))
             if step.on_invalid:
                 targets.append(("on_invalid", step.on_invalid))
-            targets.extend((f"dtmf[{digit}]", target) for digit, target in step.dtmf.items())
             targets.extend(
                 (f"voice[{phrase}]", target) for phrase, target in step.voice.items()
             )
@@ -172,16 +168,10 @@ def _parse_step(step_name: str, raw: Any) -> Step:
             raise ScenarioError(f"шаг {step_name!r}: prompt должен быть непустой строкой")
         prompt = prompt.strip()
 
-    raw_dtmf = raw.get("dtmf") or {}
-    if not isinstance(raw_dtmf, dict):
-        raise ScenarioError(f"шаг {step_name!r}: dtmf должен быть объектом")
-    dtmf: dict[str, str] = {}
-    for digit, target in raw_dtmf.items():
-        if not isinstance(digit, str) or len(digit) != 1 or digit.upper() not in DTMF_ALPHABET:
-            raise ScenarioError(f"шаг {step_name!r}: некорректная DTMF-цифра {digit!r}")
-        if not isinstance(target, str) or not target.strip():
-            raise ScenarioError(f"шаг {step_name!r}: для цифры {digit!r} не указан шаг перехода")
-        dtmf[digit.upper()] = target.strip()
+    if "dtmf" in raw:
+        raise ScenarioError(
+            f"шаг {step_name!r}: поле dtmf больше не поддерживается; используйте voice и llm"
+        )
 
     timeout_ms = _as_int(raw.get("timeout_ms"), where, "timeout_ms", DEFAULT_TIMEOUT_MS)
     max_attempts = _as_int(raw.get("max_attempts"), where, "max_attempts", DEFAULT_MAX_ATTEMPTS)
@@ -214,7 +204,6 @@ def _parse_step(step_name: str, raw: Any) -> Step:
         label=_as_str(raw.get("label"), where, "label", default=step_name),
         prompt=prompt,
         next=_as_optional_str(raw.get("next"), where, "next"),
-        dtmf=MappingProxyType(dtmf),
         on_timeout=_as_optional_str(raw.get("on_timeout"), where, "on_timeout"),
         on_invalid=_as_optional_str(raw.get("on_invalid"), where, "on_invalid"),
         timeout_ms=timeout_ms,

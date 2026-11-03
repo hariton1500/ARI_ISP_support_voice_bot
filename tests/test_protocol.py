@@ -11,7 +11,6 @@ from app.audiosocket.protocol import (
     Frame,
     FrameKind,
     encode_audio,
-    encode_dtmf,
     encode_frame,
     encode_terminate,
     kind_name,
@@ -28,7 +27,7 @@ def _reader_with(data: bytes) -> asyncio.StreamReader:
 
 def test_encode_frame_header_is_big_endian() -> None:
     packet = encode_frame(FrameKind.UUID, bytes(range(16)))
-    assert packet[:3] == b"\x01\x00\x10"  # тип 0x01, длина 16 (big-endian)
+    assert packet[:3] == b"\x01\x00\x10"
     assert packet[3:] == bytes(range(16))
 
 
@@ -40,14 +39,6 @@ def test_encode_audio_drops_half_sample() -> None:
 
 def test_encode_terminate_is_three_zero_bytes() -> None:
     assert encode_terminate() == b"\x00\x00\x00"
-
-
-def test_encode_dtmf_and_invalid_digit() -> None:
-    assert encode_dtmf("5") == b"\x03\x00\x01" + b"5"
-    with pytest.raises(ValueError):
-        encode_dtmf("12")
-    with pytest.raises(ValueError):
-        encode_dtmf("Z")
 
 
 def test_frame_payload_too_large() -> None:
@@ -70,7 +61,7 @@ def test_read_frame_round_trip() -> None:
     assert first is not None and first.as_uuid() == channel
     assert second is not None and second.kind == FrameKind.AUDIO_8K
     assert second.sample_rate == 8000
-    assert third is None  # EOF
+    assert third is None
 
 
 def test_read_frame_partial_payload_raises() -> None:
@@ -89,14 +80,6 @@ def test_read_frame_timeout() -> None:
 
     with pytest.raises(asyncio.TimeoutError):
         asyncio.run(scenario())
-
-
-def test_dtmf_frame_parsing() -> None:
-    assert Frame(FrameKind.DTMF, b"5").as_dtmf() == "5"
-    assert Frame(FrameKind.DTMF, b"*").as_dtmf() == "*"
-    assert Frame(FrameKind.DTMF, b"z").as_dtmf() is None
-    assert Frame(FrameKind.DTMF, b"55").as_dtmf() is None
-    assert Frame(FrameKind.AUDIO_8K, b"5").as_dtmf() is None
 
 
 def test_uuid_frame_with_bad_length() -> None:

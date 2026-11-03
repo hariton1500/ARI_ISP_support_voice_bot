@@ -6,7 +6,6 @@
 Типы фреймов:
     0x00 — завершение соединения;
     0x01 — UUID канала (16 байт бинарного представления);
-    0x03 — DTMF-цифра (1 байт ASCII);
     0x10..0x18 — PCM 16-бит, моно, little-endian, с частотой 8..192 кГц;
     0xff — ошибка (payload — код ошибки).
 
@@ -25,14 +24,10 @@ HEADER_SIZE = 3
 MAX_PAYLOAD = 0xFFFF
 _HEADER = struct.Struct(">BH")
 
-# DTMF, который принимает Asterisk.
-DTMF_ALPHABET = frozenset("0123456789*#ABCD")
-
 
 class FrameKind(IntEnum):
     TERMINATE = 0x00
     UUID = 0x01
-    DTMF = 0x03
     AUDIO_8K = 0x10
     AUDIO_12K = 0x11
     AUDIO_16K = 0x12
@@ -63,7 +58,6 @@ AUDIO_KINDS = frozenset(AUDIO_SAMPLE_RATES)
 _KIND_NAMES = {
     FrameKind.TERMINATE: "TERMINATE",
     FrameKind.UUID: "UUID",
-    FrameKind.DTMF: "DTMF",
     FrameKind.AUDIO_8K: "AUDIO_8K",
     FrameKind.AUDIO_12K: "AUDIO_12K",
     FrameKind.AUDIO_16K: "AUDIO_16K",
@@ -103,16 +97,6 @@ class Frame:
             return None
         return uuid.UUID(bytes=self.payload)
 
-    def as_dtmf(self) -> str | None:
-        """DTMF-цифра из фрейма 0x03 (None, если payload некорректен)."""
-        if self.kind != FrameKind.DTMF or len(self.payload) != 1:
-            return None
-        try:
-            digit = self.payload.decode("ascii").upper()
-        except UnicodeDecodeError:
-            return None
-        return digit if digit in DTMF_ALPHABET else None
-
 
 def encode_frame(kind: int, payload: bytes = b"") -> bytes:
     """Собрать фрейм AudioSocket."""
@@ -128,13 +112,6 @@ def encode_audio(pcm: bytes) -> bytes:
     if len(pcm) % 2:
         pcm = pcm[:-1]
     return encode_frame(FrameKind.AUDIO_8K, pcm)
-
-
-def encode_dtmf(digit: str) -> bytes:
-    """Фрейм DTMF (нужен в основном для тестов и сценариев отправки цифр)."""
-    if len(digit) != 1 or digit.upper() not in DTMF_ALPHABET:
-        raise ValueError(f"некорректная DTMF-цифра: {digit!r}")
-    return encode_frame(FrameKind.DTMF, digit.upper().encode("ascii"))
 
 
 def encode_terminate() -> bytes:
@@ -165,8 +142,8 @@ async def read_frame(
 async def read_uuid_frame(reader: asyncio.StreamReader) -> uuid.UUID | None:
     """Дождаться первого осмысленного фрейма: UUID канала или завершение.
 
-    Всё, что приходит до UUID (аудио, DTMF), игнорируется. None означает, что
-    соединение закрыто или Asterisk сообщил об ошибке.
+    Все фреймы до UUID, кроме завершения и ошибки, игнорируются. None означает,
+    что соединение закрыто или Asterisk сообщил об ошибке.
     """
     while True:
         frame = await read_frame(reader)

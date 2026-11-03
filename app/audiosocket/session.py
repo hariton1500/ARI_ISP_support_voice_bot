@@ -1,12 +1,11 @@
-"""Обработка одного вызова AudioSocket.
+"""Обработка одного голосового вызова AudioSocket.
 
-Сессия получает фреймы от Asterisk, проигрывает промпты с реальным темпом,
-принимает DTMF, пишет входящий звук в WAV и складывает рядом JSON-метаданные
-для разбора инцидентов.
+Сессия получает PCM от Asterisk, ведёт диалог через STT/LLM/TTS, проигрывает
+ответы с реальным темпом, пишет входящий звук в WAV и сохраняет JSON-метаданные.
 
 Схема работы с Asterisk:
 
-    Asterisk --(TCP: UUID, PCM, DTMF)--> AudioSocketServer --> CallSession
+    Asterisk --(TCP: UUID, PCM)--> AudioSocketServer --> CallSession
 
 Asterisk подключается к боту сам (см. диалплан `AudioSocket(${UUID()},host:port)`),
 поэтому сервер — это мы, а не Asterisk.
@@ -77,7 +76,7 @@ def _similar_text(first: str, second: str) -> bool:
 
 
 class InputBuffer:
-    """Очередь ввода (DTMF-цифры или распознанные фразы).
+    """Очередь распознанных реплик.
 
     asyncio.Queue не подходит: отмена get() может «съесть» уже пришедший
     элемент. Здесь deque + Event, а признак закрытия позволяет разбудить
@@ -123,7 +122,6 @@ class CallStats:
     started_wall: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     audio_frames: int = 0
     audio_bytes: int = 0
-    dtmf_digits: list[str] = field(default_factory=list)
     steps: list[str] = field(default_factory=list)
     hangup_reason: str = "dialog_end"
     #: Финальные распознанные реплики (AITUNNEL STT).
@@ -178,7 +176,6 @@ class CallSession:
         self._channel_id: str | None = None
 
         self.session_id: str | None = None
-        self._digits = InputBuffer()
         self._transcripts = InputBuffer()
         self._input_changed = asyncio.Event()
         self._player = AudioPlayer(self._send_audio)
@@ -219,13 +216,11 @@ class CallSession:
             if self._pending is not None:
                 self.session_id = self._pending.uuid
                 self._channel_id = self._pending.channel_id
-                for digit in self._pending.drain_digits():
-                    self._digits.push(digit)
             else:
                 self.session_id = str(self._channel_uuid)
             self._open_recorder()
             if self._pending is not None:
-                self._pending.attach(self)
+                self._pending.attach()
             self._log.info(
                 "вызов %s: диалог начат (канал=%s, peer=%s, голос=%s)",
                 self.session_id,
@@ -267,7 +262,6 @@ class CallSession:
         """Аварийно прервать вызов (используется при остановке сервера)."""
         self._closed = True
         self._player.stop()
-        self._digits.close()
         self._transcripts.close()
         self._input_changed.set()
         with contextlib.suppress(Exception):
@@ -285,8 +279,6 @@ class CallSession:
                     break
                 if frame.kind in AUDIO_KINDS:
                     self._on_audio(frame)
-                elif frame.kind == FrameKind.DTMF:
-                    self._on_dtmf(frame)
                 elif frame.kind == FrameKind.TERMINATE:
                     self._stats.hangup_reason = "terminated"
                     break
@@ -315,7 +307,6 @@ class CallSession:
         finally:
             self._closed = True
             self._player.stop()
-            self._digits.close()
             self._transcripts.close()
             self._input_changed.set()
 
@@ -457,34 +448,6 @@ class CallSession:
         self._transcripts.push(text)
         self._notify_input()
 
-    def push_digit(self, digit: str) -> None:
-        """Принять DTMF-цифру: из фрейма AudioSocket или события ARI."""
-        if self._closed or not digit:
-            return
-        self._stats.dtmf_digits.append(digit)
-        self._log.info("вызов %s: DTMF %r", self.session_id, digit)
-        if self._player.is_playing:
-            self._player.stop()
-        self._digits.push(digit)
-        self._notify_input()
-
-    def _on_dtmf(self, frame: Frame) -> None:
-        digit = frame.as_dtmf()
-        if digit is None:
-            self._log.debug("вызов %s: некорректный DTMF-фрейм %r", self.session_id, frame.payload)
-            return
-        if self._pending is not None:
-            # В ARI-режиме Asterisk присылает цифру дважды: фреймом AudioSocket и
-            # событием ChannelDtmfReceived. Источник истины — ARI, иначе шаг
-            # сработает повторно на возврате в меню.
-            self._log.debug(
-                "вызов %s: DTMF %r из AudioSocket пропущен (используем событие ARI)",
-                self.session_id,
-                digit,
-            )
-            return
-        self.push_digit(digit)
-
     async def _send_audio(self, pcm: bytes) -> None:
         if self._closed:
             raise ConnectionAbortedError("вызов завершён")
@@ -516,14 +479,14 @@ class CallSession:
                 return await self._run_llm_step(step, prompt)
             self._log.warning(
                 "вызов %s: шаг %s, LLM не настроена (нужен AITUNNEL_API_KEY) — "
-                "работают только DTMF/voice",
+                "свободный диалог недоступен",
                 self.session_id,
                 step.name,
             )
         return await self._run_input_step(step, prompt)
 
     async def _run_input_step(self, step: Step, prompt: str | None) -> str | None:
-        """Обычный шаг: промпт, DTMF/voice, повторы и fallback."""
+        """Обычный шаг: промпт, голосовые команды, повторы и fallback."""
         attempts = 0
         while True:
             if self._closed:
@@ -531,44 +494,27 @@ class CallSession:
             await self._play_prompt(step, prompt)
             if step.hangup:
                 return None
-            if not step.dtmf and not step.voice:
+            if not step.voice:
                 return step.next
 
             if self._closed:
                 raise ConnectionAbortedError("вызов завершён")
             attempts += 1
-            digit, text = await self._wait_input(step)
-
-            target: str | None = None
-            if digit is not None:
-                target = step.dtmf.get(digit)
-            elif text is not None:
-                target = match_voice(text, step.dtmf, step.voice)
+            text = await self._wait_input(step)
+            target = match_voice(text, step.voice) if text is not None else None
 
             if target is not None:
-                if digit is not None:
-                    self._log.info(
-                        "вызов %s: шаг %s, цифра %r -> %s",
-                        self.session_id,
-                        step.name,
-                        digit,
-                        target,
-                    )
-                else:
-                    self._log.info(
-                        "вызов %s: шаг %s, фраза %r -> %s",
-                        self.session_id,
-                        step.name,
-                        text,
-                        target,
-                    )
+                self._log.info(
+                    "вызов %s: шаг %s, фраза %r -> %s",
+                    self.session_id,
+                    step.name,
+                    text,
+                    target,
+                )
                 return target
 
-            has_input = digit is not None or text is not None
-            if has_input:
-                description = f"неверная цифра {digit!r}" if digit else f"фраза не распознана {text!r}"
-            else:
-                description = "нет ввода"
+            has_input = text is not None
+            description = f"фраза не распознана {text!r}" if has_input else "нет ввода"
 
             # Исчерпали попытки — уходим по fallback-переходу.
             if attempts >= step.max_attempts:
@@ -596,11 +542,10 @@ class CallSession:
     async def _run_llm_step(self, step: Step, prompt: str | None) -> str | None:
         """Промпт шага, затем свободный диалог с LLM и инструментами.
 
-        DTMF и `voice`-команды сценария остаются быстрыми переходами. Всё
-        остальное уходит модели; её ответ озвучивается через TTS, а barge-in
-        работает так же, как для обычного промпта. При тишине или неизвестной
-        цифре промпт повторяется до `max_attempts`, затем срабатывает
-        `on_timeout`/`on_invalid`.
+        Голосовые команды сценария остаются быстрыми переходами. Всё остальное
+        уходит модели; её ответ озвучивается через TTS, а barge-in работает так
+        же, как для обычного промпта. При тишине промпт повторяется до
+        `max_attempts`, затем срабатывает `on_timeout`.
         """
         if self._llm is None:
             return await self._run_input_step(step, prompt)
@@ -614,46 +559,9 @@ class CallSession:
         tools = VoiceTools(self._billing, logger=self._log)
         conversation = self._llm.conversation(tools)
         silent_attempts = 0
-        invalid_attempts = 0
 
         while not self._closed:
-            digit, text = await self._wait_input(step)
-            if digit is not None:
-                target = step.dtmf.get(digit)
-                if target is not None:
-                    self._log.info(
-                        "вызов %s: шаг %s (LLM), цифра %r -> %s",
-                        self.session_id,
-                        step.name,
-                        digit,
-                        target,
-                    )
-                    return target
-
-                invalid_attempts += 1
-                if invalid_attempts >= step.max_attempts:
-                    self._log.info(
-                        "вызов %s: шаг %s (LLM), цифра %r без перехода, "
-                        "попытки исчерпаны -> %s",
-                        self.session_id,
-                        step.name,
-                        digit,
-                        step.on_invalid or step.on_timeout or "завершение вызова",
-                    )
-                    return step.on_invalid or step.on_timeout
-
-                self._log.info(
-                    "вызов %s: шаг %s (LLM), цифра %r без перехода "
-                    "(попытка %d из %d)",
-                    self.session_id,
-                    step.name,
-                    digit,
-                    invalid_attempts,
-                    step.max_attempts,
-                )
-                await self._play_prompt(step, prompt)
-                continue
-
+            text = await self._wait_input(step)
             if text is None:
                 silent_attempts += 1
                 if silent_attempts >= step.max_attempts:
@@ -679,7 +587,7 @@ class CallSession:
                 await self._play_prompt(step, prompt)
                 continue
 
-            target = match_voice(text, step.dtmf, step.voice)
+            target = match_voice(text, step.voice)
             if target is not None:
                 self._log.info(
                     "вызов %s: шаг %s (LLM), фраза %r -> %s",
@@ -691,7 +599,6 @@ class CallSession:
                 return target
 
             silent_attempts = 0
-            invalid_attempts = 0
             self._log.info("вызов %s: LLM запрос: %r", self.session_id, text)
             before = getattr(conversation, "tool_calls", 0)
             try:
@@ -896,10 +803,9 @@ class CallSession:
             source = number or ""
         return "".join(ch for ch in source if ch.isalnum() or ch in {"-", "_"})
 
-    async def _wait_input(self, step: Step) -> tuple[str | None, str | None]:
-        """Дождаться DTMF или распознанной фразы.
+    async def _wait_input(self, step: Step) -> str | None:
+        """Дождаться распознанной фразы; None означает таймаут.
 
-        Возвращает (цифра, текст); (None, None) — таймаут.
         Событие `_input_changed` общее, поэтому отмена ожидания не «съедает»
         уже пришедший ввод.
         """
@@ -907,29 +813,20 @@ class CallSession:
         timeout = max(0.0, step.timeout_ms / 1000.0)
         deadline = loop.time() + timeout
         while True:
-            digit = self._digits.pop_nowait()
-            if digit is not None:
-                return digit, None
             text = self._transcripts.pop_nowait()
             if text is not None:
-                return None, text
-            if self._closed or self._digits.closed or self._transcripts.closed:
+                return text
+            if self._closed or self._transcripts.closed:
                 raise ConnectionAbortedError("вызов завершён")
             remaining = deadline - loop.time()
             if remaining <= 0:
-                return None, None
+                return None
             self._input_changed.clear()
             try:
                 await asyncio.wait_for(self._input_changed.wait(), timeout=remaining)
             except asyncio.TimeoutError:
-                # Проверим буферы ещё раз: ввод мог прийти до таймаута.
-                digit = self._digits.pop_nowait()
-                if digit is not None:
-                    return digit, None
-                text = self._transcripts.pop_nowait()
-                if text is not None:
-                    return None, text
-                return None, None
+                # Проверим буфер ещё раз: реплика могла прийти до таймаута.
+                return self._transcripts.pop_nowait()
 
     # ----------------------------------------------- запись и метаданные
 
@@ -964,6 +861,10 @@ class CallSession:
             recorder.duration_ms / 1000.0,
         )
 
+    def _metadata_extra(self) -> dict[str, Any]:
+        """Поля конкретного голосового движка для sidecar-JSON."""
+        return {"voice_provider": self._settings.voice_provider}
+
     def _write_metadata(self) -> None:
         """Положить рядом с записью JSON с ходом диалога."""
         if self.session_id is None or self._recording_path is None:
@@ -979,7 +880,6 @@ class CallSession:
             "duration_seconds": round(duration, 3),
             "audio_frames": self._stats.audio_frames,
             "audio_seconds": round(self._stats.audio_bytes / (SAMPLE_RATE * 2), 3),
-            "dtmf": "".join(self._stats.dtmf_digits),
             "steps": list(self._stats.steps),
             "transcripts": list(self._stats.transcripts),
             "partial_transcripts": list(self._stats.partial_transcripts),
@@ -994,6 +894,7 @@ class CallSession:
             "hangup_reason": self._stats.hangup_reason,
             "billing": self._stats.billing,
             "recording": self._recording_path.name,
+            **self._metadata_extra(),
         }
         path = self._recording_path.with_suffix(".json")
         try:
@@ -1006,7 +907,6 @@ class CallSession:
     async def _shutdown(self) -> None:
         self._closed = True
         self._player.stop()
-        self._digits.close()
         self._transcripts.close()
         self._input_changed.set()
         if self._voice is not None:
@@ -1047,13 +947,12 @@ class CallSession:
                 await self._pending.close(self._stats.hangup_reason)
 
         self._log.info(
-            "вызов %s: завершён (канал=%s, причина=%s, шаги=%s, DTMF=%s, "
+            "вызов %s: завершён (канал=%s, причина=%s, шаги=%s, "
             "речь=%s, barge-in=%d, аудио=%.1f с, запись=%s)",
             self.session_id,
             self._channel_id or "-",
             self._stats.hangup_reason,
             "->".join(self._stats.steps) or "-",
-            "".join(self._stats.dtmf_digits) or "-",
             " | ".join(self._stats.transcripts) or "-",
             self._stats.barge_ins,
             self._stats.audio_bytes / (SAMPLE_RATE * 2),

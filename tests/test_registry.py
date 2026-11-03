@@ -9,31 +9,11 @@ import pytest
 from app.audiosocket.registry import PendingCall, PendingRegistry
 
 
-class FakeSession:
-    def __init__(self) -> None:
-        self.digits: list[str] = []
-
-    def push_digit(self, digit: str) -> None:
-        self.digits.append(digit)
-
-
-def test_digits_are_buffered_before_connection() -> None:
-    call = PendingCall(uuid="u-1", channel_id="call-1", caller_number="7900")
-    call.push_digit("1")
-    call.push_digit("2")
-    assert call.drain_digits() == ["1", "2"]
-    assert call.drain_digits() == []
-
-
-def test_digits_go_to_session_after_attach() -> None:
+def test_attach_marks_call_connected() -> None:
     call = PendingCall(uuid="u-1", channel_id="call-1")
-    session = FakeSession()
-    call.attach(session)
+    assert not call.connected.is_set()
+    call.attach()
     assert call.connected.is_set()
-
-    call.push_digit("5")
-    assert session.digits == ["5"]
-    assert call.drain_digits() == []
 
 
 def test_close_calls_callback_once() -> None:

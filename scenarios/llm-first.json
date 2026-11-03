@@ -1,6 +1,6 @@
 {
   "name": "llm-first",
-  "description": "LLM-first: свободный диалог без озвученного меню, скрытые DTMF-переходы",
+  "description": "Свободный голосовой диалог без меню",
   "initial": "greeting",
   "steps": {
     "greeting": {
@@ -15,11 +15,6 @@
       "llm": true,
       "timeout_ms": 8000,
       "max_attempts": 2,
-      "dtmf": {
-        "2": "tech_support",
-        "3": "payment",
-        "0": "operator"
-      },
       "voice": {
         "оператор": "operator",
         "соедините с оператором": "operator"
@@ -32,23 +27,13 @@
       "prompt": "no_input.wav",
       "next": "fallback"
     },
-    "tech_support": {
-      "label": "техподдержка (заглушка)",
-      "prompt": "tech_support.wav",
-      "next": "dialog"
-    },
-    "payment": {
-      "label": "оплата (заглушка)",
-      "prompt": "payment.wav",
-      "next": "dialog"
-    },
     "operator": {
       "label": "соединение с оператором",
       "prompt": "operator.wav",
       "hangup": true
     },
     "fallback": {
-      "label": "перевод на оператора после нескольких неудач",
+      "label": "завершение после отсутствия ввода",
       "prompt": "fallback.wav",
       "hangup": true
     }

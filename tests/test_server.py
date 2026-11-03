@@ -17,7 +17,6 @@ from app.audiosocket.protocol import (
     Frame,
     FrameKind,
     encode_audio,
-    encode_dtmf,
     encode_frame,
     read_frame,
 )
@@ -75,10 +74,6 @@ async def _call_flow(settings: Settings, scenario: Scenario, prompts: PromptMap)
             received += frame.payload
         assert len(received) % 2 == 0
 
-        # Цифра 0 — переход к оператору и завершение вызова.
-        writer.write(encode_dtmf("0"))
-        await writer.drain()
-
         frames = await _read_until_eof(reader)
         assert any(frame.kind == FrameKind.TERMINATE for frame in frames), frames
         writer.close()
@@ -99,7 +94,7 @@ async def _call_flow(settings: Settings, scenario: Scenario, prompts: PromptMap)
     meta_path = recording.with_suffix(".json")
     assert meta_path.is_file()
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    assert meta["dtmf"] == "0"
+    assert "dtmf" not in meta
     assert meta["steps"] == ["greeting", "menu", "operator"]
     assert meta["hangup_reason"] == "hangup_step"
     assert meta["audio_frames"] >= 5
@@ -349,7 +344,6 @@ def _voice_scenario(
                     "llm": llm,
                     "timeout_ms": timeout_ms,
                     "max_attempts": 2,
-                    "dtmf": {"0": "operator", "1": "operator"},
                     "voice": {"оператор": "operator", "соедините с оператором": "operator"},
                     "on_timeout": "operator",
                     "on_invalid": "operator",
@@ -557,8 +551,11 @@ def test_llm_step_answers_free_speech_and_ends_call(tmp_path: Path) -> None:
     assert meta["tts_characters"] == len("Тарифы уточняются по адресу. Всего доброго!")
 
 
-def test_llm_first_scenario_answers_free_speech_without_menu(tmp_path: Path) -> None:
-    scenario = Scenario.load(PROJECT_ROOT / "scenarios" / "llm-first.json")
+@pytest.mark.parametrize("scenario_name", ["default.json", "llm-first.json"])
+def test_live_scenarios_answer_free_speech_without_menu(
+    tmp_path: Path, scenario_name: str
+) -> None:
+    scenario = Scenario.load(PROJECT_ROOT / "scenarios" / scenario_name)
     text = "Расскажите, какие у вас тарифы"
     speech = _FakeSpeech(text=text, tts_pcm=b"\x01\x00" * 80)
     llm = _FakeLLM()
@@ -572,43 +569,19 @@ def test_llm_first_scenario_answers_free_speech_without_menu(tmp_path: Path) -> 
     assert meta["hangup_reason"] == "llm_end_call"
 
 
-async def _llm_disabled_flow(tmp_path: Path) -> dict[str, Any]:
-    """Сценарий с LLM-шагом, но без настроенной LLM: DTMF должен работать."""
-    scenario = _voice_scenario(llm=True)
-    prompts_dir = tmp_path / "llm-disabled-prompts"
-    write_wav(prompts_dir / "greeting.wav", duration_ms=1000)
-    write_wav(prompts_dir / "menu.wav", duration_ms=200)
-    write_wav(prompts_dir / "operator.wav", duration_ms=100)
-    prompts = load_prompts(scenario, prompts_dir)
-    settings = _voice_settings(tmp_path, prompts_dir)
-
-    channel_uuid = uuid.uuid4()
-    server = AudioSocketServer(settings, scenario, prompts, speech=None, llm=None)
-    await server.start()
-    try:
-        reader, writer = await asyncio.open_connection("127.0.0.1", server.bound_port)
-        writer.write(encode_frame(FrameKind.UUID, channel_uuid.bytes))
-        await writer.drain()
-        await asyncio.sleep(0.1)
-        writer.write(encode_dtmf("0"))
-        await writer.drain()
-        await _read_until_eof(reader, timeout=10.0)
-        writer.close()
-        with contextlib.suppress(Exception):
-            await writer.wait_closed()
-    finally:
-        await server.close()
-
-    return json.loads(
-        (settings.recordings_dir / f"{channel_uuid}.json").read_text(encoding="utf-8")
+def test_llm_step_without_backend_still_handles_voice_command(tmp_path: Path) -> None:
+    speech = _FakeSpeech()
+    meta = asyncio.run(
+        _voice_flow(
+            tmp_path,
+            speech,
+            llm=None,
+            scenario=_voice_scenario(llm=True),
+        )
     )
 
-
-def test_llm_step_without_backend_still_handles_dtmf(tmp_path: Path) -> None:
-    meta = asyncio.run(_llm_disabled_flow(tmp_path))
-
     assert meta["steps"] == ["greeting", "menu", "operator"]
-    assert meta["dtmf"] == "0"
+    assert meta["transcripts"] == ["Соедините с оператором"]
     assert meta["llm_turns"] == 0
     assert meta["hangup_reason"] == "hangup_step"
 

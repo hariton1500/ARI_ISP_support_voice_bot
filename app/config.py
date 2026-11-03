@@ -129,6 +129,18 @@ class Settings:
     billing_timeout: float = 10.0
     billing_mock: bool = False
 
+    # Голосовой движок: раздельные STT/LLM/TTS AITUNNEL либо Yandex Realtime.
+    voice_provider: str = "aitunnel"
+
+    # Yandex AI Studio Realtime: один WebSocket для STT, LLM и LiveTTS.
+    yandex_api_key: str | None = None
+    yandex_folder_id: str | None = None
+    yandex_realtime_url: str = "wss://ai.api.cloud.yandex.net/v1/realtime/openai"
+    yandex_realtime_model: str = "speech-realtime-max-tts-live/latest"
+    yandex_realtime_voice: str = "sofia"
+    yandex_realtime_timeout: float = 10.0
+    yandex_data_logging: bool = False
+
     # Речь: AITUNNEL — OpenAI-совместимый API (STT /audio/transcriptions,
     # TTS /audio/speech). Ключ sk-aitunnel-…; без него речь выключена.
     ai_tunnel_api_key: str | None = None
@@ -167,6 +179,13 @@ class Settings:
     llm_max_tool_rounds: int = 4
     llm_history_messages: int = 40
 
+    def __post_init__(self) -> None:
+        if self.voice_provider not in {"aitunnel", "yandex_realtime"}:
+            raise ValueError(
+                "VOICE_PROVIDER: ожидалось aitunnel или yandex_realtime, "
+                f"получено {self.voice_provider!r}"
+            )
+
     @classmethod
     def from_env(cls) -> Settings:
         return cls(
@@ -195,6 +214,18 @@ class Settings:
             billing_token=_get_optional_str("BILLING_TOKEN"),
             billing_timeout=_get_float("BILLING_TIMEOUT", 10.0),
             billing_mock=_get_bool("BILLING_MOCK", False),
+            voice_provider=_get_str("VOICE_PROVIDER", "aitunnel").lower(),
+            yandex_api_key=_get_optional_str("YANDEX_API_KEY"),
+            yandex_folder_id=_get_optional_str("YANDEX_FOLDER_ID"),
+            yandex_realtime_url=_get_str(
+                "YANDEX_REALTIME_URL", "wss://ai.api.cloud.yandex.net/v1/realtime/openai"
+            ),
+            yandex_realtime_model=_get_str(
+                "YANDEX_REALTIME_MODEL", "speech-realtime-max-tts-live/latest"
+            ),
+            yandex_realtime_voice=_get_str("YANDEX_REALTIME_VOICE", "sofia"),
+            yandex_realtime_timeout=_get_float("YANDEX_REALTIME_TIMEOUT", 10.0),
+            yandex_data_logging=_get_bool("YANDEX_DATA_LOGGING", False),
             ai_tunnel_api_key=_get_optional_str("AITUNNEL_API_KEY"),
             ai_tunnel_base_url=_get_str("AITUNNEL_BASE_URL", "https://api.aitunnel.ru/v1"),
             stt_model=_get_str("STT_MODEL", "whisper-large-v3-turbo"),
@@ -242,6 +273,15 @@ class Settings:
         return bool(self.billing_base_url and self.billing_token) or self.billing_mock
 
     @property
+    def realtime_enabled(self) -> bool:
+        """Yandex Realtime выбран явно и имеет оба обязательных параметра."""
+        return (
+            self.voice_provider == "yandex_realtime"
+            and bool(self.yandex_api_key)
+            and bool(self.yandex_folder_id)
+        )
+
+    @property
     def speech_enabled(self) -> bool:
         """AITUNNEL готов: есть ключ и не отключён голосовой ввод/синтез."""
         return bool(self.ai_tunnel_api_key)
@@ -272,7 +312,12 @@ class Settings:
         data: dict[str, object] = {}
         for field in self.__slots__:
             value = getattr(self, field)
-            secret = field in {"ari_password", "billing_token", "ai_tunnel_api_key"}
+            secret = field in {
+                "ari_password",
+                "billing_token",
+                "ai_tunnel_api_key",
+                "yandex_api_key",
+            }
             data[field] = "***" if secret and value else value
         return data
 

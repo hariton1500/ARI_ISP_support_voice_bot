@@ -5,7 +5,7 @@
     -> bridges/{id}/addChannel (абонент + медиаканал)
 
 Звук идёт по AudioSocket (ExternalMedia подключается к нашему серверу сам),
-DTMF приходят событиями ChannelDtmfReceived, завершение — через DELETE.
+завершение выполняется через DELETE.
 """
 
 from __future__ import annotations
@@ -137,12 +137,6 @@ class AriCallManager:
 
         if etype == "StasisStart":
             await self._on_stasis_start(channel_id, channel)
-        elif etype == "ChannelDtmfReceived":
-            digit = str(event.get("digit") or "").upper()
-            call = self._calls_by_channel.get(channel_id)
-            if call is not None and digit:
-                self._log.debug("вызов %s: DTMF %r", call.channel_id, digit)
-                call.push_digit(digit)
         elif etype in {"StasisEnd", "ChannelHangupRequest", "ChannelDestroyed"}:
             await self._on_channel_gone(channel_id, etype)
 

@@ -9,10 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
 
 #: Колбэк завершения вызова (причина -> очистка через ARI).
 CloseCallback = Callable[[str], Awaitable[None]]
@@ -31,33 +29,15 @@ class PendingCall:
     on_close: CloseCallback | None = field(default=None, repr=False)
     connected: asyncio.Event = field(default_factory=asyncio.Event)
 
-    #: Буфер цифр, пришедших до подключения TCP.
-    _digits: deque[str] = field(default_factory=deque, repr=False)
-    _session: Any = field(default=None, repr=False)
     _closed: bool = field(default=False, repr=False)
 
     @property
     def is_closed(self) -> bool:
         return self._closed
 
-    def push_digit(self, digit: str) -> None:
-        """Передать цифру в сессию (или в буфер, если TCP ещё не подключился)."""
-        if self._closed or not digit:
-            return
-        if self._session is not None:
-            self._session.push_digit(digit)
-        else:
-            self._digits.append(digit)
-
-    def attach(self, session: Any) -> None:
-        """Привязать запущенную сессию; отдать накопленные цифры."""
-        self._session = session
+    def attach(self) -> None:
+        """Отметить, что медиапоток подключён к сессии."""
         self.connected.set()
-
-    def drain_digits(self) -> list[str]:
-        items = list(self._digits)
-        self._digits.clear()
-        return items
 
     async def close(self, reason: str) -> None:
         """Завершить вызов один раз: вызвать колбэк очистки."""

@@ -14,7 +14,7 @@ import pytest
 from app.ari.client import AriClient, AriError
 from app.ari.events import AriEventStream
 from app.ari.manager import AriCallManager
-from app.audiosocket.protocol import Frame, FrameKind, encode_dtmf, encode_frame, read_frame
+from app.audiosocket.protocol import Frame, FrameKind, encode_frame, read_frame
 from app.audiosocket.registry import PendingRegistry
 from app.audiosocket.server import AudioSocketServer
 from app.config import Settings
@@ -146,7 +146,7 @@ def _scenario(tmp_path: Path) -> Scenario:
                 "prompt": "menu.wav",
                 "timeout_ms": 300,
                 "max_attempts": 1,
-                "dtmf": {"1": "bye"},
+                "voice": {"завершить": "bye"},
                 "on_timeout": "bye",
             },
             "bye": {"prompt": "bye.wav", "hangup": True},
@@ -166,7 +166,7 @@ async def _read_audio(reader: asyncio.StreamReader, minimum: int) -> int:
 
 
 def test_full_call_flow(tmp_path: Path) -> None:
-    """StasisStart → бридж → ExternalMedia → AudioSocket → DTMF → очистка."""
+    """StasisStart → бридж → ExternalMedia → AudioSocket → голосовой шаг → очистка."""
 
     async def scenario() -> None:
         fake = FakeAri()
@@ -198,21 +198,13 @@ def test_full_call_flow(tmp_path: Path) -> None:
                 assert media["external_host"] == f"127.0.0.1:{port}"
                 session_uuid = uuid.UUID(media["data"])
 
-                # «Asterisk» подключается к нашему AudioSocket с UUID из data
+                # «Asterisk» подключается к нашему AudioSocket с UUID из data.
                 reader, writer = await asyncio.open_connection("127.0.0.1", port)
                 writer.write(encode_frame(FrameKind.UUID, session_uuid.bytes))
                 await writer.drain()
                 assert await wait_until(lambda: len(registry) == 0, timeout=5.0)
 
                 await _read_audio(reader, 640)
-                # Asterisk сообщает о цифре дважды: фреймом AudioSocket и событием ARI.
-                # Учитываться должна только одна — иначе шаг сработает повторно.
-                writer.write(encode_dtmf("1"))
-                await writer.drain()
-                await fake.send_event(
-                    {"type": "ChannelDtmfReceived", "digit": "1", "channel": {"id": "call-1"}}
-                )
-
                 while True:
                     frame = await asyncio.wait_for(read_frame(reader), timeout=5.0)
                     if frame is None:
@@ -241,7 +233,7 @@ def test_full_call_flow(tmp_path: Path) -> None:
         assert recording.is_file(), "запись не создана"
         meta = json.loads(recording.with_suffix(".json").read_text(encoding="utf-8"))
         assert meta["steps"] == ["greeting", "menu", "bye"]
-        assert meta["dtmf"] == "1"
+        assert "dtmf" not in meta
         assert meta["channel_id"] == "call-1"
         assert meta["caller"] == "79001112233"
         assert meta["hangup_reason"] == "hangup_step"

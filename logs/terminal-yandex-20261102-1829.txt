@@ -1,0 +1,53 @@
+(.venv) PS E:\AIWorkProjects\ARI_ISP_support_voice_bot> python tools/check_realtime.py
+>> python -m app --check --voice-provider yandex_realtime
+>> python -m app --voice-provider yandex_realtime
+2026-11-02 18:27:41 INFO    [check_realtime] промпты LLM: 4 документ(ов), 19031 символов (E:\AIWorkProjects\ARI_ISP_support_voice_bot\prompts\llm)
+2026-11-02 18:27:41 INFO    [check_realtime] Yandex Realtime подключён: gpt://b1g23dbkelnmtnlv0g9s/speech-realtime-max-tts-live/latest
+2026-11-02 18:27:42 INFO    [check_realtime] Yandex Realtime: session.updated; ключ, модель и настройки приняты
+2026-11-02 18:27:43 WARNING [app] EXTERNAL_MEDIA_HOST не задан, использую 172.18.185.162. Если Asterisk вне локальной сети, укажите публичный адрес/домен и проброс порта 9092
+2026-11-02 18:27:43 INFO    [app] промпты: загружено 5 из 5
+2026-11-02 18:27:43 INFO    [app] промпты LLM: 4 документ(ов), 19031 символов (E:\AIWorkProjects\ARI_ISP_support_voice_bot\prompts\llm)
+2026-11-02 18:27:43 INFO    [app] проверка пройдена: сценарий 'llm-first', шагов 5, промптов 5/5, ARI: включён, LLM-промптов: 4
+2026-11-02 18:27:44 WARNING [app] EXTERNAL_MEDIA_HOST не задан, использую 172.18.185.162. Если Asterisk вне локальной сети, укажите публичный адрес/домен и проброс порта 9092
+2026-11-02 18:27:44 INFO    [app] промпты: загружено 5 из 5
+2026-11-02 18:27:44 INFO    [app] промпты LLM: 4 документ(ов), 19031 символов (E:\AIWorkProjects\ARI_ISP_support_voice_bot\prompts\llm)
+2026-11-02 18:27:44 INFO    [app] биллинг: http://maxbot.91.195.230.18.sslip.io/integration/subscriber/by-id
+2026-11-02 18:27:44 INFO    [app] Yandex Realtime: модель speech-realtime-max-tts-live/latest, голос sofia, PCM 16 кГц, VAD 700 мс тишины; логирование данных у провайдера: выкл
+2026-11-02 18:27:44 INFO    [app.audiosocket.server] AudioSocket слушает: ('0.0.0.0', 9092)
+2026-11-02 18:27:44 INFO    [app] бот готов: сценарий 'llm-first' (5 шагов), промптов 5, AudioSocket порт 9092, адреса: 172.18.185.162
+2026-11-02 18:27:44 INFO    [app] ARI: приложение 'ivr_ai', события ws://sip2.evpanet.com:8088/ari/events?app=ivr_ai, ExternalMedia -> 172.18.185.162:9092
+2026-11-02 18:27:44 INFO    [app.ari.manager] ARI WebSocket подключён: ws://sip2.evpanet.com:8088/ari/events?app=ivr_ai
+2026-11-02 18:27:57 INFO    [app.ari.manager] ARI StasisStart: канал 1793633276.140 (PJSIP/510-00000029, состояние=Ring)
+2026-11-02 18:27:57 INFO    [app.ari.manager] ARI: новый вызов 1793633276.140 от 510, сессия beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9
+2026-11-02 18:27:57 INFO    [app.ari.manager] ARI ChannelStateChange: канал 1793633276.140 (PJSIP/510-00000029, состояние=Up)
+2026-11-02 18:27:57 INFO    [app.audiosocket.server] новое AudioSocket-соединение от 91.195.230.13:49722
+2026-11-02 18:27:57 INFO    [app.ari.manager] ARI ChannelStateChange: канал 1793633276.141 (AudioSocket/172.18.185.162:9092-beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9, состояние=Up)
+2026-11-02 18:27:57 INFO    [app.ari.manager] ARI StasisStart: канал 1793633276.141 (AudioSocket/172.18.185.162:9092-beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9, состояние=Up)
+2026-11-02 18:27:57 INFO    [app.ari.manager] ARI: медиаканал 1793633276.141 вошёл в Stasis
+2026-11-02 18:27:57 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: диалог начат (канал=1793633276.140, peer=91.195.230.13:49722, голос=выкл)
+2026-11-02 18:27:57 INFO    [app.ari.manager] ARI ChannelEnteredBridge: канал 1793633276.140 (PJSIP/510-00000029, состояние=Up)
+2026-11-02 18:27:57 INFO    [app.ari.manager] ARI ChannelEnteredBridge: канал 1793633276.141 (AudioSocket/172.18.185.162:9092-beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9, состояние=Up)
+2026-11-02 18:27:57 INFO    [app.ari.manager] вызов 1793633276.140: бридж e5065f52-3811-4b5a-a7ae-8e7d855f02d5, медиаканал 1793633276.141, ждём TCP на 172.18.185.162:9092
+2026-11-02 18:27:57 INFO    [app.ari.manager] вызов 1793633276.140: медиапоток подключён
+2026-11-02 18:27:57 INFO    [app.audiosocket.server] Yandex Realtime подключён: gpt://b1g23dbkelnmtnlv0g9s/speech-realtime-max-tts-live/latest
+2026-11-02 18:27:58 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: пошёл звук от абонента
+2026-11-02 18:27:59 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: Realtime ответ: 'Здравствуйте! Меня зовут ботовый ассистент компании Евпанет. Чем могу помочь?'
+2026-11-02 18:28:01 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: Realtime barge-in — воспроизведение остановлено2026-11-02 18:28:02 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: Realtime STT: 'меня зовут'
+2026-11-02 18:28:03 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: Realtime первая аудиодельта через 328 мс
+2026-11-02 18:28:03 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: Realtime ответ: 'Поняла. Пожалуйста, назовите свой номер лицевого счёта, чтобы я мог помочь вам с информацией по вашему счёту.'
+2026-11-02 18:28:04 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: Realtime barge-in — воспроизведение остановлено2026-11-02 18:28:05 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: Realtime STT: 'поняла'
+2026-11-02 18:28:05 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: Realtime первая аудиодельта через 344 мс
+2026-11-02 18:28:06 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: Realtime ответ: 'Спасибо! Пожалуйста, сообщите номер вашего лицевого счёта, чтобы я мог проверить баланс и текущий тариф.'
+2026-11-02 18:28:14 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: Realtime barge-in — воспроизведение остановлено2026-11-02 18:28:15 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: Realtime STT: 'двадцать'
+2026-11-02 18:28:16 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: Realtime первая аудиодельта через 406 мс
+2026-11-02 18:28:16 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: Realtime ответ: 'Поняла.Номер лицевого счёта — 20.Проверяю информацию.'
+2026-11-02 18:28:23 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: Realtime запросила оператора
+2026-11-02 18:28:23 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: запись сохранена E:\AIWorkProjects\ARI_ISP_support_voice_bot\recordings\beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9.wav (25.0 с входящего звука)
+2026-11-02 18:28:23 INFO    [app.ari.manager] вызов 1793633276.140: очистка ARI (причина realtime_transfer)
+2026-11-02 18:28:23 INFO    [app.ari.manager] ARI ChannelLeftBridge: канал 1793633276.141 (AudioSocket/172.18.185.162:9092-beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9, состояние=Up)
+2026-11-02 18:28:23 INFO    [app.ari.manager] ARI StasisEnd: канал 1793633276.141 (AudioSocket/172.18.185.162:9092-beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9, состояние=Up)
+2026-11-02 18:28:23 INFO    [app.ari.manager] ARI ChannelDestroyed: канал 1793633276.141 (AudioSocket/172.18.185.162:9092-beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9), причина 16 (Normal Clearing)
+2026-11-02 18:28:23 INFO    [app.ari.manager] ARI ChannelLeftBridge: канал 1793633276.140 (PJSIP/510-00000029, состояние=Up)
+2026-11-02 18:28:23 INFO    [app.ari.manager] ARI ChannelHangupRequest: канал 1793633276.140 (PJSIP/510-00000029), причина 32 (без описания)
+2026-11-02 18:28:23 INFO    [app.ari.manager] ARI StasisEnd: канал 1793633276.140 (PJSIP/510-00000029, состояние=Up)
+2026-11-02 18:28:23 INFO    [app.audiosocket.server] вызов beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9: завершён (канал=1793633276.140, причина=realtime_transfer, шаги=realtime, речь=меня зовут | поняла | двадцать, barge-in=3, аудио=25.0 с, запись=E:\AIWorkProjects\ARI_ISP_support_voice_bot\recordings\beb84ac2-bb8d-4f06-af2f-ea46fd1d45a9.wav)

@@ -1,73 +1,31 @@
 {
   "name": "default",
-  "description": "Меню службы поддержки абонентов: баланс, техподдержка, оплата, оператор",
+  "description": "Свободный голосовой диалог со службой поддержки",
   "initial": "greeting",
   "steps": {
     "greeting": {
       "label": "приветствие",
       "prompt": "greeting.wav",
-      "next": "menu"
+      "next": "dialog"
     },
-    "menu": {
-      "label": "главное меню",
-      "prompt": "menu.wav",
+    "dialog": {
+      "label": "свободный диалог",
+      "prompt": "dialog.wav",
+      "text": "Чем я могу помочь?",
       "llm": true,
       "timeout_ms": 8000,
       "max_attempts": 2,
-      "dtmf": {
-        "1": "balance",
-        "2": "tech_support",
-        "3": "payment",
-        "9": "menu_repeat",
-        "0": "operator"
-      },
       "voice": {
-        "баланс": "balance",
-        "проверить баланс": "balance",
-        "техподдержка": "tech_support",
-        "тех поддержка": "tech_support",
-        "интернет не работает": "tech_support",
-        "оплата": "payment",
-        "оплатить": "payment",
         "оператор": "operator",
-        "соедините с оператором": "operator",
-        "повторите меню": "menu_repeat"
+        "соедините с оператором": "operator"
       },
-      "on_invalid": "invalid_digit",
+      "on_invalid": "no_input",
       "on_timeout": "no_input"
-    },
-    "menu_repeat": {
-      "label": "повтор меню",
-      "prompt": "menu.wav",
-      "next": "menu"
-    },
-    "invalid_digit": {
-      "label": "неверная цифра",
-      "prompt": "invalid_digit.wav",
-      "next": "menu"
     },
     "no_input": {
       "label": "нет ввода",
       "prompt": "no_input.wav",
-      "next": "menu"
-    },
-    "balance": {
-      "label": "баланс из биллинга",
-      "prompt": "balance.wav",
-      "prompt_not_found": "balance_not_found.wav",
-      "prompt_error": "balance_error.wav",
-      "billing": "caller",
-      "next": "menu"
-    },
-    "tech_support": {
-      "label": "техподдержка (заглушка)",
-      "prompt": "tech_support.wav",
-      "next": "menu"
-    },
-    "payment": {
-      "label": "оплата (заглушка)",
-      "prompt": "payment.wav",
-      "next": "menu"
+      "next": "fallback"
     },
     "operator": {
       "label": "соединение с оператором",
@@ -75,7 +33,7 @@
       "hangup": true
     },
     "fallback": {
-      "label": "перевод на оператора после нескольких неудач",
+      "label": "завершение после отсутствия ввода",
       "prompt": "fallback.wav",
       "hangup": true
     }

@@ -24,6 +24,8 @@ from app.config import Settings
 from app.dialog.prompts import PromptMap
 from app.dialog.scenario import Scenario
 from app.llm.conversation import LLMBackend
+from app.llm.prompts import LLMPromptSet
+from app.realtime.session import RealtimeCallSession
 from app.speech.client import SpeechBackend
 
 
@@ -40,6 +42,7 @@ class AudioSocketServer:
         billing: BillingLookup | None = None,
         speech: SpeechBackend | None = None,
         llm: LLMBackend | None = None,
+        llm_prompts: LLMPromptSet | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._settings = settings
@@ -49,6 +52,7 @@ class AudioSocketServer:
         self._billing = billing
         self._speech = speech
         self._llm = llm
+        self._llm_prompts = llm_prompts
         self._log = logger or logging.getLogger("app.audiosocket.server")
         self._server: asyncio.AbstractServer | None = None
         self._sessions: set[CallSession] = set()
@@ -128,20 +132,36 @@ class AudioSocketServer:
                         channel_uuid,
                     )
 
-            session = CallSession(
-                reader,
-                writer,
-                self._settings,
-                self._scenario,
-                self._prompts,
-                channel_uuid=channel_uuid,
-                pending=pending,
-                billing=self._billing,
-                speech=self._speech,
-                llm=self._llm,
-                logger=self._log,
-                peer=peer_name,
-            )
+            common = {
+                "channel_uuid": channel_uuid,
+                "pending": pending,
+                "billing": self._billing,
+                "logger": self._log,
+                "peer": peer_name,
+            }
+            if self._settings.voice_provider == "yandex_realtime":
+                if self._llm_prompts is None:
+                    raise RuntimeError("для Yandex Realtime не загружены LLM-промпты")
+                session = RealtimeCallSession(
+                    reader,
+                    writer,
+                    self._settings,
+                    self._scenario,
+                    self._prompts,
+                    self._llm_prompts,
+                    **common,
+                )
+            else:
+                session = CallSession(
+                    reader,
+                    writer,
+                    self._settings,
+                    self._scenario,
+                    self._prompts,
+                    speech=self._speech,
+                    llm=self._llm,
+                    **common,
+                )
             self._sessions.add(session)
             try:
                 await session.run()

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.dialog.intents import match_voice, normalize_text, spoken_digit
+from app.dialog.intents import match_voice, normalize_text
 
 
 def test_normalize_removes_punctuation_and_yo() -> None:
@@ -12,26 +12,13 @@ def test_normalize_removes_punctuation_and_yo() -> None:
     assert normalize_text("Всё хорошо") == "все хорошо"
 
 
-def test_spoken_digit_words_and_numbers() -> None:
-    assert spoken_digit("нажмите один") == "1"
-    assert spoken_digit("раз") == "1"
-    assert spoken_digit("я выбираю 3") == "3"
-    assert spoken_digit("оператор") is None
-
-
-def test_match_voice_prefers_phrase_over_digit() -> None:
-    dtmf = {"1": "balance", "0": "operator"}
+def test_match_voice_finds_configured_phrases() -> None:
     voice = {"проверить баланс": "balance", "оператор": "operator"}
-    assert match_voice("Проверить баланс, пожалуйста", dtmf, voice) == "balance"
-    assert match_voice("соедините с оператором", dtmf, voice) == "operator"
-
-
-def test_match_voice_falls_back_to_spoken_dtmf() -> None:
-    dtmf = {"1": "balance", "2": "tech_support", "0": "operator"}
-    assert match_voice("два", dtmf, {}) == "tech_support"
-    assert match_voice("нажмите ноль", dtmf, {}) == "operator"
+    assert match_voice("Проверить баланс, пожалуйста", voice) == "balance"
+    assert match_voice("соедините с оператором", voice) == "operator"
 
 
 def test_match_voice_ignores_unmatched_speech() -> None:
-    assert match_voice("погода сегодня хорошая", {"1": "balance"}, {}) is None
-    assert match_voice("", {"1": "balance"}, {}) is None
+    assert match_voice("погода сегодня хорошая", {"оператор": "operator"}) is None
+    assert match_voice("два", {"оператор": "operator"}) is None
+    assert match_voice("", {"оператор": "operator"}) is None

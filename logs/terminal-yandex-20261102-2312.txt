@@ -1,0 +1,44 @@
+(.venv) PS E:\AIWorkProjects\ARI_ISP_support_voice_bot> python -m app --voice-provider yandex_realtime
+2026-11-02 23:06:47 WARNING [app] EXTERNAL_MEDIA_HOST не задан, использую 172.18.185.162. Если Asterisk вне локальной сети, укажите публичный адрес/домен и проброс порта 9092
+2026-11-02 23:06:47 INFO    [app] промпты: загружено 5 из 5
+2026-11-02 23:06:48 INFO    [app] промпты LLM: 4 документ(ов), 19627 символов (E:\AIWorkProjects\ARI_ISP_support_voice_bot\prompts\llm)
+2026-11-02 23:06:48 INFO    [app] биллинг: http://maxbot.91.195.230.18.sslip.io/integration/subscriber/by-id
+2026-11-02 23:06:48 INFO    [app] Yandex Realtime: модель speech-realtime-max-tts-live/latest, голос sofia, PCM 16 кГц, VAD 700 мс тишины; логирование данных у провайдера: выкл
+2026-11-02 23:06:48 INFO    [app.audiosocket.server] AudioSocket слушает: ('0.0.0.0', 9092)
+2026-11-02 23:06:48 INFO    [app] бот готов: сценарий 'llm-first' (5 шагов), промптов 5, AudioSocket порт 9092, адреса: 172.18.185.162
+2026-11-02 23:06:48 INFO    [app] ARI: приложение 'ivr_ai', события ws://sip2.evpanet.com:8088/ari/events?app=ivr_ai, ExternalMedia -> 172.18.185.162:9092
+2026-11-02 23:06:48 INFO    [app.ari.manager] ARI WebSocket подключён: ws://sip2.evpanet.com:8088/ari/events?app=ivr_ai
+2026-11-02 23:09:52 INFO    [app.ari.manager] ARI StasisStart: канал 1793650190.144 (PJSIP/510-0000002a, состояние=Ring)
+2026-11-02 23:09:52 INFO    [app.ari.manager] ARI: новый вызов 1793650190.144 от 510, сессия 24cf5ee9-de5e-4c3d-b620-59ecc95c4885
+2026-11-02 23:09:52 INFO    [app.ari.manager] ARI ChannelStateChange: канал 1793650190.144 (PJSIP/510-0000002a, состояние=Up)
+2026-11-02 23:09:52 INFO    [app.audiosocket.server] новое AudioSocket-соединение от 91.195.230.13:48678
+2026-11-02 23:09:52 INFO    [app.audiosocket.server] вызов 24cf5ee9-de5e-4c3d-b620-59ecc95c4885: диалог начат (канал=1793650190.144, peer=91.195.230.13:48678, голос=выкл)
+2026-11-02 23:09:52 INFO    [app.ari.manager] ARI ChannelStateChange: канал 1793650190.145 (AudioSocket/172.18.185.162:9092-24cf5ee9-de5e-4c3d-b620-59ecc95c4885, состояние=Up)
+2026-11-02 23:09:52 INFO    [app.ari.manager] ARI StasisStart: канал 1793650190.145 (AudioSocket/172.18.185.162:9092-24cf5ee9-de5e-4c3d-b620-59ecc95c4885, состояние=Up)
+2026-11-02 23:09:52 INFO    [app.ari.manager] ARI: медиаканал 1793650190.145 вошёл в Stasis
+2026-11-02 23:09:52 INFO    [app.ari.manager] ARI ChannelEnteredBridge: канал 1793650190.144 (PJSIP/510-0000002a, состояние=Up)
+2026-11-02 23:09:52 INFO    [app.ari.manager] ARI ChannelEnteredBridge: канал 1793650190.145 (AudioSocket/172.18.185.162:9092-24cf5ee9-de5e-4c3d-b620-59ecc95c4885, состояние=Up)
+2026-11-02 23:09:52 INFO    [app.ari.manager] вызов 1793650190.144: бридж 9381b3ed-e463-443a-a081-51c7c128c743, медиаканал 1793650190.145, ждём TCP на 172.18.185.162:9092
+2026-11-02 23:09:52 INFO    [app.ari.manager] вызов 1793650190.144: медиапоток подключён
+2026-11-02 23:09:52 INFO    [app.audiosocket.server] Yandex Realtime подключён: gpt://b1g23dbkelnmtnlv0g9s/speech-realtime-max-tts-live/latest
+2026-11-02 23:09:52 INFO    [app.audiosocket.server] вызов 24cf5ee9-de5e-4c3d-b620-59ecc95c4885: пошёл звук от абонента
+2026-11-02 23:09:53 INFO    [app.audiosocket.server] вызов 24cf5ee9-de5e-4c3d-b620-59ecc95c4885: Realtime ответ: 'Здравствуйте! Я — голосовой ассистент провайдера «Евпанет». Чем могу помочь?'
+2026-11-02 23:10:02 INFO    [app.audiosocket.server] вызов 24cf5ee9-de5e-4c3d-b620-59ecc95c4885: Realtime STT: 'а у меня интернет не работает'
+2026-11-02 23:10:03 INFO    [app.audiosocket.server] вызов 24cf5ee9-de5e-4c3d-b620-59ecc95c4885: Realtime первая аудиодельта через 500 мс
+2026-11-02 23:10:03 INFO    [app.audiosocket.server] вызов 24cf5ee9-de5e-4c3d-b620-59ecc95c4885: Realtime ответ: 'Чтобы помочь вам, мне нужно знать ваш номер лицевого счёта. Пожалуйста, назовите его.'
+2026-11-02 23:10:12 INFO    [app.audiosocket.server] вызов 24cf5ee9-de5e-4c3d-b620-59ecc95c4885: Realtime STT: 'двадцать'
+2026-11-02 23:10:12 INFO    [app.audiosocket.server] вызов 24cf5ee9-de5e-4c3d-b620-59ecc95c4885: Realtime первая аудиодельта через 313 мс
+2026-11-02 23:10:13 INFO    [app.audiosocket.server] вызов 24cf5ee9-de5e-4c3d-b620-59ecc95c4885: Realtime ответ: 'Спасибо. Позвольте уточнить, вы назвали число 20?Номер счёта обычно состоит из большего количества цифр.Пожалуйста, проверьте его и назовите ещё раз.'
+2026-11-02 23:10:24 INFO    [app.audiosocket.server] вызов 24cf5ee9-de5e-4c3d-b620-59ecc95c4885: Realtime STT: 'двадцать'
+2026-11-02 23:10:25 INFO    [app.audiosocket.server] вызов 24cf5ee9-de5e-4c3d-b620-59ecc95c4885: Realtime первая аудиодельта через 359 мс
+2026-11-02 23:10:25 INFO    [app.audiosocket.server] вызов 24cf5ee9-de5e-4c3d-b620-59ecc95c4885: Realtime ответ: 'Поняла. Номер счёта 20. Сейчас проверю информацию.'
+2026-11-02 23:10:31 INFO    [app.audiosocket.server] вызов 24cf5ee9-de5e-4c3d-b620-59ecc95c4885: Realtime запросила оператора
+2026-11-02 23:10:31 INFO    [app.audiosocket.server] вызов 24cf5ee9-de5e-4c3d-b620-59ecc95c4885: запись сохранена E:\AIWorkProjects\ARI_ISP_support_voice_bot\recordings\24cf5ee9-de5e-4c3d-b620-59ecc95c4885.wav (39.3 с входящего звука)
+2026-11-02 23:10:31 INFO    [app.ari.manager] вызов 1793650190.144: очистка ARI (причина realtime_transfer)
+2026-11-02 23:10:31 INFO    [app.ari.manager] ARI ChannelLeftBridge: канал 1793650190.145 (AudioSocket/172.18.185.162:9092-24cf5ee9-de5e-4c3d-b620-59ecc95c4885, состояние=Up)
+2026-11-02 23:10:31 INFO    [app.ari.manager] ARI StasisEnd: канал 1793650190.145 (AudioSocket/172.18.185.162:9092-24cf5ee9-de5e-4c3d-b620-59ecc95c4885, состояние=Up)
+2026-11-02 23:10:31 INFO    [app.ari.manager] ARI ChannelDestroyed: канал 1793650190.145 (AudioSocket/172.18.185.162:9092-24cf5ee9-de5e-4c3d-b620-59ecc95c4885), причина 16 (Normal Clearing)
+2026-11-02 23:10:31 INFO    [app.ari.manager] ARI ChannelLeftBridge: канал 1793650190.144 (PJSIP/510-0000002a, состояние=Up)
+2026-11-02 23:10:31 INFO    [app.audiosocket.server] вызов 24cf5ee9-de5e-4c3d-b620-59ecc95c4885: завершён (канал=1793650190.144, причина=realtime_transfer, шаги=realtime, речь=а у меня интернет не работает | двадцать | двадцать, barge-in=0, аудио=39.3 с, запись=E:\AIWorkProjects\ARI_ISP_support_voice_bot\recordings\24cf5ee9-de5e-4c3d-b620-59ecc95c4885.wav)
+2026-11-02 23:10:31 INFO    [app.ari.manager] ARI ChannelHangupRequest: канал 1793650190.144 (PJSIP/510-0000002a), причина 32 (без описания)
+2026-11-02 23:10:31 INFO    [app.ari.manager] ARI StasisEnd: канал 1793650190.144 (PJSIP/510-0000002a, состояние=Up)
